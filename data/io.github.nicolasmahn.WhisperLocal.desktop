@@ -1,0 +1,10 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper Local
+Comment=Hold a key, speak, and the words appear where you type
+Exec=whisper-local
+Icon=io.github.nicolasmahn.WhisperLocal
+Terminal=false
+Categories=Utility;Accessibility;
+Keywords=dictation;speech;voice;transcribe;
+StartupNotify=true

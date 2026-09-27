@@ -1,0 +1,77 @@
+.whisper-local-indicator {
+    padding: 2px;
+    border-radius: 5px;
+}
+
+.whisper-local-idle {
+    color: #e7e7e7;
+}
+
+.whisper-local-listening {
+    color: #ffffff;
+    background-color: #c53232;
+}
+
+.whisper-local-transcribing {
+    color: #8cbce6;
+}
+
+.whisper-local-problem {
+    color: #f1bd5b;
+}
+
+.whisper-local-disabled {
+    color: #777777;
+}
+
+.whisper-local-transcript {
+    max-width: 300px;
+}
+
+/* The pill follows the GNOME OSD look (like the volume popup). */
+.whisper-local-pill {
+    color: #ffffff;
+    background-color: rgba(46, 46, 51, 0.94);
+    border: 1px solid rgba(255, 255, 255, 0.06);
+    border-radius: 999px;
+    box-shadow: 0 2px 10px rgba(0, 0, 0, 0.35);
+    padding: 12px 20px;
+    margin-bottom: 3em;
+    spacing: 14px;
+}
+
+.whisper-local-bars {
+    height: 28px;
+    spacing: 4px;
+}
+
+.whisper-local-bar {
+    width: 5px;
+    border-radius: 3px;
+    background-color: #ffffff;
+}
+
+.whisper-local-pill-transcribing .whisper-local-bar {
+    background-color: #8cbce6;
+}
+
+.whisper-local-pill-text {
+    font-size: 0.9em;
+    color: rgba(255, 255, 255, 0.7);
+}
+
+.whisper-local-pill-problem .whisper-local-pill-text {
+    color: #ffffff;
+}
+
+.whisper-local-pill-dot {
+    width: 10px;
+    height: 10px;
+    border-radius: 5px;
+    background-color: #c53232;
+}
+
+.whisper-local-pill-icon {
+    icon-size: 16px;
+    color: #f1bd5b;
+}

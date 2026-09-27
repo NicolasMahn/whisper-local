@@ -1,0 +1,7 @@
+{
+  "uuid": "whisper-local@nicolasmahn.github.io",
+  "name": "Whisper Local",
+  "description": "Dictation status and controls for Whisper Local",
+  "url": "https://github.com/NicolasMahn/whisper-local",
+  "shell-version": ["49"]
+}

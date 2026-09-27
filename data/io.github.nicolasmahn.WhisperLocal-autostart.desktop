@@ -1,0 +1,9 @@
+[Desktop Entry]
+Type=Application
+Name=Whisper Local
+Comment=Hold a key, speak, and the words appear where you type
+Exec=whisper-local --background
+Icon=io.github.nicolasmahn.WhisperLocal
+Terminal=false
+NoDisplay=true
+X-GNOME-Autostart-enabled=true

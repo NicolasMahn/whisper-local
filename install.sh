@@ -20,6 +20,10 @@ if [[ ! -d .venv ]]; then
 fi
 "$uv" sync -q
 
+echo "Installing the built-in Whisper engine..."
+"$repo/scripts/build-whisper-cpp.sh"
+"$repo/scripts/download-model.sh"
+
 # Desktop files need an absolute Exec path; quoted in case the repo path has spaces.
 exec_path="\"$repo/.venv/bin/whisper-local\""
 mkdir -p "$data/applications" "$data/icons/hicolor/scalable/apps" "$autostart"

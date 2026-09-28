@@ -57,6 +57,7 @@ def test_request_sends_auth_model_file_and_optional_language(language, monkeypat
     assert request.get_header("Authorization") == "Bearer secret-key"
     assert timeout == 30
     assert fields["model"] == b"qwen-test"
+    assert fields["response_format"] == b"json"
     assert fields["file"] == wav
     assert "prompt" not in fields
     if language:

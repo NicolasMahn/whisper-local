@@ -2,6 +2,13 @@
 # Reverses install.sh. Keeps ~/.config/whisper-local and the repo's .venv.
 set -euo pipefail
 
+if [[ $# -gt 1 || ( $# -eq 1 && $1 != --yes ) ]]; then
+    echo "Usage: $0 [--yes]" >&2
+    exit 2
+fi
+remove_engine=false
+[[ ${1:-} == --yes ]] && remove_engine=true
+
 repo="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd -P)"
 app_id=io.github.nicolasmahn.WhisperLocal
 uuid=whisper-local@nicolasmahn.github.io
@@ -36,6 +43,23 @@ fi
 rm -f "$data/applications/$app_id.desktop" \
     "$data/icons/hicolor/scalable/apps/$app_id.svg" \
     "$autostart/$app_id.desktop"
+
+engine_dir="$data/whisper-local/whisper.cpp"
+model="$data/whisper-local/models/ggml-large-v3-turbo-q8_0.bin"
+if [[ -e "$engine_dir/whisper-server" || -e "$engine_dir/VERSION" || -e "$model" ]]; then
+    if [[ "$remove_engine" != true ]]; then
+        printf 'Remove the built-in Whisper binary and ~1 GB model? [y/N] ' >&2
+        if IFS= read -r answer && [[ "$answer" == [yY] || "$answer" == [yY][eE][sS] ]]; then
+            remove_engine=true
+        fi
+    fi
+    if [[ "$remove_engine" == true ]]; then
+        rm -f -- "$engine_dir/whisper-server" "$engine_dir/VERSION" "$model"
+        echo "Removed the built-in Whisper engine and model."
+    else
+        echo "Kept the built-in Whisper engine and model."
+    fi
+fi
 if command -v update-desktop-database > /dev/null; then
     update-desktop-database -q "$data/applications"
 fi

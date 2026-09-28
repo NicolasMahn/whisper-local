@@ -45,6 +45,13 @@ SERVER_LOOK = {
     "unauthorized": ("Key rejected", "error"),
     "unreachable": ("Unreachable", "error"),
 }
+ENGINE_STATUS = {
+    "starting": "Starting…",
+    "ready": "Ready",
+    "not_installed": "Not installed",
+    "failed": "Unavailable",
+    "stopped": "Starting…",
+}
 
 
 def _copy_button(on_click) -> Gtk.Button:
@@ -82,7 +89,7 @@ class Window(Adw.ApplicationWindow):
         page.add(self._status_group())
         page.add(self._recent_group)
         page.add(self._dictation_group())
-        page.add(self._server_group())
+        page.add(self._speech_group())
 
         toolbar = Adw.ToolbarView(content=page)
         toolbar.add_top_bar(header)
@@ -92,8 +99,10 @@ class Window(Adw.ApplicationWindow):
         for name in ("state", "enabled", "problem"):
             application.connect(f"notify::{name}", lambda *_: self._show_status())
         application.connect("notify::recent", lambda *_: self._show_recent())
+        application.connect("notify::engine-state", lambda *_: self._show_engine())
         self._show_status()
         self._show_recent()
+        self._show_engine()
         # The server may have come up or gone away while the window was hidden.
         self.connect("map", lambda _window: self._check_server())
 
@@ -166,7 +175,16 @@ class Window(Adw.ApplicationWindow):
             group.add(row)
         return group
 
-    def _server_group(self) -> Adw.PreferencesGroup:
+    def _speech_group(self) -> Adw.PreferencesGroup:
+        self._engines = ["builtin", "server"]
+        self._engine_row = Adw.ComboRow(
+            title="Speech engine",
+            model=Gtk.StringList.new([
+                "Built-in (Whisper large-v3-turbo on this computer)", "Server"
+            ]),
+            selected=self._engines.index(self._app.config.engine),
+        )
+        self._engine_row.connect("notify::selected", self._engine_selected)
         self._server_row = Adw.EntryRow(
             title="Speech server", text=self._app.config.url, show_apply_button=True
         )
@@ -176,6 +194,7 @@ class Window(Adw.ApplicationWindow):
         self._server_row.add_suffix(self._server_label)
 
         group = Adw.PreferencesGroup()
+        group.add(self._engine_row)
         group.add(self._server_row)
         self._api_key_row = Adw.PasswordEntryRow(
             title="API key", text=self._app.config.api_key, show_apply_button=True
@@ -195,6 +214,14 @@ class Window(Adw.ApplicationWindow):
         self._known_rows = []
         self._show_known_words()
         return group
+
+    def _show_engine(self) -> None:
+        builtin = self._app.config.engine == "builtin"
+        self._server_row.set_visible(not builtin)
+        self._api_key_row.set_visible(not builtin)
+        self._engine_row.set_subtitle(
+            ENGINE_STATUS.get(self._app.engine_state, "Starting…") if builtin else ""
+        )
 
     def _show_known_words(self) -> None:
         for row in self._known_rows:
@@ -284,6 +311,14 @@ class Window(Adw.ApplicationWindow):
     def _language_selected(self, row, _pspec) -> None:
         self._app.change_settings(language=self._languages[row.get_selected()])
 
+    def _engine_selected(self, row, _pspec) -> None:
+        engine = self._engines[row.get_selected()]
+        if engine != self._app.config.engine:
+            self._app.change_settings(engine=engine)
+            self._show_engine()
+            if engine == "server":
+                self._check_server()
+
     def _server_applied(self, row) -> None:
         self._app.change_settings(url=row.get_text().strip().rstrip("/"))
         self._check_server()
@@ -293,6 +328,8 @@ class Window(Adw.ApplicationWindow):
         self._check_server()
 
     def _check_server(self) -> None:
+        if self._app.config.engine != "server":
+            return
         config = self._app.config
         self._show_server("checking")
 

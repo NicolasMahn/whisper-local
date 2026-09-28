@@ -47,7 +47,7 @@ def _response_text(payload: bytes) -> str | None:
 
 
 def transcribe(wav: bytes, config: Config, timeout: float = 30) -> str:
-    fields = {"model": config.model}
+    fields = {"model": config.model, "response_format": "json"}
     if config.language:
         fields["language"] = config.language
     if config.vocabulary:

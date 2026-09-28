@@ -4,6 +4,7 @@ import sys
 import threading
 import time
 import tomllib
+from dataclasses import replace
 
 import sounddevice as sd
 from gi.repository import Adw, Gio, GLib, GObject
@@ -11,6 +12,7 @@ from gi.repository import Adw, Gio, GLib, GObject
 from whisper_local import config as config_module
 from whisper_local import cues, linux
 from whisper_local.app import Dictation
+from whisper_local.engine import Engine, installed_paths
 from whisper_local.platform import KEYS
 from whisper_local.recorder import Recorder
 from whisper_local.transcribe import TranscriptionError, transcribe
@@ -65,6 +67,7 @@ class Application(Adw.Application):
     hands_free_key = GObject.Property(type=str, default="")
     recent = GObject.Property(type=GObject.TYPE_STRV)
     problem = GObject.Property(type=str, default="")
+    engine_state = GObject.Property(type=str, default="stopped")
 
     def __init__(self):
         super().__init__(application_id=APP_ID)
@@ -79,11 +82,13 @@ class Application(Adw.Application):
         # A problem that stops dictation outright stays; failures of single
         # dictations show over it for a few seconds.
         self._lasting_problem = ""
+        self._engine_problem = ""
+        self._engine: Engine | None = None
         self._listening = False
         self._problem_timeout = 0
         try:
             self.config = config_module.load()
-        except (OSError, tomllib.TOMLDecodeError, TypeError) as error:
+        except (OSError, tomllib.TOMLDecodeError, TypeError, ValueError):
             print("whisper-local: settings file unreadable", file=sys.stderr)
             self.config = config_module.Config()
             self._lasting_problem = "Settings file unreadable"
@@ -110,7 +115,14 @@ class Application(Adw.Application):
         self.set_accels_for_action("app.quit", ["<Control>q"])
         self.set_accels_for_action("window.close", ["<Control>w"])
         self._prepare_paste()
+        self._configure_engine()
         self._start_dictation()
+
+    def do_shutdown(self):
+        engine, self._engine = self._engine, None
+        if engine is not None:
+            engine.stop()
+        Adw.Application.do_shutdown(self)
 
     def do_activate(self):
         if self._background:
@@ -133,14 +145,48 @@ class Application(Adw.Application):
 
     def change_settings(self, **changes) -> None:
         """Save changed settings and use them from the next dictation on."""
+        previous = self.config
         self.config = config_module.save(changes)
         if "key" in changes or "hands_free_key" in changes:
             self._restart()
+        elif self.config.engine != previous.engine or (
+            self.config.engine == "builtin" and self.config.language != previous.language
+        ):
+            self._configure_engine()
 
     def _restart(self) -> None:
         # The keyboard listener blocks in a thread that cannot be stopped, so
         # a new key takes a fresh process. It shows the window again.
+        if self._engine is not None:
+            self._engine.stop()
         os.execv(sys.executable, [sys.executable, "-m", "whisper_local"])
+
+    def _configure_engine(self) -> None:
+        previous, self._engine = self._engine, None
+        if previous is not None:
+            previous.stop()
+        if self.config.engine == "server":
+            self._update("engine_state", "server")
+            self._set_engine_problem("")
+            return
+        binary, model = installed_paths()
+        engine = Engine(
+            binary, model, self.config.language,
+            on_state=lambda state: _on_main_loop(self._engine_changed, engine, state),
+        )
+        self._engine = engine
+        engine.start()
+
+    def _engine_changed(self, engine: Engine, state: str) -> None:
+        if engine is not self._engine:
+            return
+        self._update("engine_state", state)
+        problem = {
+            "starting": "Speech engine starting…",
+            "not_installed": "Speech engine not installed — run install.sh",
+            "failed": "Speech engine stopped — check the journal",
+        }.get(state, "")
+        self._set_engine_problem(problem)
 
     def _start_dictation(self) -> None:
         self._dictation = Dictation(
@@ -204,7 +250,13 @@ class Application(Adw.Application):
 
     def _transcribe(self, wav: bytes) -> str:
         # Reads self.config per call so changed settings apply without a restart.
-        text = transcribe(wav, self.config)
+        settings = self.config
+        if settings.engine == "builtin":
+            engine = self._engine
+            if engine is None or not engine.wait_ready() or engine.url is None:
+                raise TranscriptionError("unreachable")
+            settings = replace(settings, url=engine.url, api_key="", model="whisper")
+        text = transcribe(wav, settings)
         if text:
             _on_main_loop(self._remember, text)
         return text
@@ -236,7 +288,12 @@ class Application(Adw.Application):
     def _set_lasting_problem(self, problem: str) -> None:
         self._lasting_problem = problem
         if not self._problem_timeout:
-            self._update("problem", problem)
+            self._update("problem", self._lasting_problem or self._engine_problem)
+
+    def _set_engine_problem(self, problem: str) -> None:
+        self._engine_problem = problem
+        if not self._problem_timeout:
+            self._update("problem", self._lasting_problem or self._engine_problem)
 
     def _failed(self, error: Exception) -> None:
         print(f"whisper-local: {_reason(error)}", file=sys.stderr)
@@ -247,7 +304,7 @@ class Application(Adw.Application):
 
     def _clear_problem(self) -> bool:
         self._problem_timeout = 0
-        self._update("problem", self._lasting_problem)
+        self._update("problem", self._lasting_problem or self._engine_problem)
         return GLib.SOURCE_REMOVE
 
 

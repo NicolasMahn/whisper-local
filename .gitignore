@@ -2,7 +2,4 @@
 __pycache__/
 *.egg-info/
 .briefs/
-macos/.build/
-macos/build/
-.DS_Store
 .env

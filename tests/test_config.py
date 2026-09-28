@@ -22,6 +22,7 @@ def test_load_reads_toml_file(tmp_path, monkeypatch):
     loaded = config.load(path)
 
     assert loaded.url == "http://speech.test/v1"
+    assert loaded.engine == "builtin"
     assert loaded.api_key == "toml-key"
     assert loaded.model == "qwen-test"
     assert loaded.key == "f13"
@@ -36,6 +37,7 @@ def test_defaults_allow_an_unauthenticated_local_server(tmp_path, monkeypatch):
     loaded = config.load(tmp_path / "missing.toml")
 
     assert loaded.url == "http://localhost:8000/v1"
+    assert loaded.engine == "builtin"
     assert loaded.api_key == ""
     assert loaded.vocabulary == []
 
@@ -128,3 +130,19 @@ def test_hands_free_key_round_trips_and_defaults_to_double_tap(tmp_path):
 
     config.save({"hands_free_key": ""}, path)
     assert config.load(path).hands_free_key == ""
+
+
+def test_engine_round_trips_and_rejects_unknown_values(tmp_path):
+    path = tmp_path / "config.toml"
+    assert config.save({"engine": "server"}, path).engine == "server"
+    assert config.load(path).engine == "server"
+    assert config.save({"engine": "builtin"}, path).engine == "builtin"
+
+    before = path.read_text()
+    with pytest.raises(ValueError, match="engine must be"):
+        config.save({"engine": "unknown"}, path)
+    assert path.read_text() == before
+
+    path.write_text('engine = "unknown"\n')
+    with pytest.raises(ValueError, match="engine must be"):
+        config.load(path)

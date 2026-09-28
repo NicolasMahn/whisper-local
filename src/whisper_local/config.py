@@ -12,6 +12,7 @@ CONFIG_PATH = Path.home() / ".config" / "whisper-local" / "config.toml"
 
 @dataclass(frozen=True)
 class Config:
+    engine: str = "builtin"
     url: str = "http://localhost:8000/v1"
     api_key: str = ""
     model: str = "qwen3-asr"
@@ -23,6 +24,8 @@ class Config:
     vocabulary: list[str] = field(default_factory=list)
 
     def __post_init__(self):
+        if self.engine not in ("builtin", "server"):
+            raise ValueError("engine must be 'builtin' or 'server'")
         if not isinstance(self.vocabulary, list) or any(
             not isinstance(word, str) for word in self.vocabulary
         ):
@@ -75,6 +78,7 @@ def save(changes: dict[str, str | bool | list[str]], path: Path = CONFIG_PATH) -
     if unknown_changes:
         raise TypeError(f"Unknown setting: {', '.join(sorted(unknown_changes))}")
     values = {**_read(path), **changes}
+    Config(**{name: value for name, value in values.items() if name in _FIELD_NAMES})
     names = [field.name for field in fields(Config) if field.name in values]
     names.extend(sorted(values.keys() - _FIELD_NAMES))
     text = "".join(

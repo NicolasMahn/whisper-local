@@ -113,10 +113,10 @@ def test_application_transcribes_with_current_vocabulary(monkeypatch):
     monkeypatch.setattr(
         gnome_app, "transcribe", lambda wav, settings: calls.append(settings.vocabulary.copy()) or ""
     )
-    app = type("App", (), {"config": config.Config(vocabulary=["Qwen"])})()
+    app = type("App", (), {"config": config.Config(engine="server", vocabulary=["Qwen"])})()
 
     gnome_app.Application._transcribe(app, b"wav")
-    app.config = config.Config(vocabulary=["Nicolas Mahn"])
+    app.config = config.Config(engine="server", vocabulary=["Nicolas Mahn"])
     gnome_app.Application._transcribe(app, b"wav")
 
     assert calls == [["Qwen"], ["Nicolas Mahn"]]

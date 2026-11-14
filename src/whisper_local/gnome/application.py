@@ -4,18 +4,27 @@ import sys
 import threading
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 
 import sounddevice as sd
 from gi.repository import Adw, Gio, GLib, GObject
 
+from whisper_local import archive, cues, linux
 from whisper_local import config as config_module
-from whisper_local import cues, linux
 from whisper_local.app import Dictation
-from whisper_local.engine import Engine, installed_paths
+from whisper_local.engine import MODEL_NAME, Engine, installed_paths
 from whisper_local.platform import KEYS
-from whisper_local.recorder import Recorder
-from whisper_local.transcribe import TranscriptionError, transcribe
+from whisper_local.recorder import Recorder, is_silent
+from whisper_local.screenshots import PendingScreenshot, Screenshots
+from whisper_local.server_model import ServerModel
+from whisper_local.transcribe import (
+    ChatTranscript,
+    TranscriptionError,
+    transcribe,
+    transcribe_chat,
+)
 
 from .service import Service
 from .window import KEYBOARD_PROBLEM, Window
@@ -34,10 +43,18 @@ def _on_main_loop(function, *args) -> None:
     GLib.idle_add(run)
 
 
+class _ModelUnavailable(Exception):
+    """The server's model cannot take this dictation; says why."""
+
+
 def _reason(error: Exception) -> str:
     """A short explanation safe to show in the UI and the journal."""
+    if isinstance(error, _ModelUnavailable):
+        return str(error)
     if isinstance(error, TranscriptionError):
         status = error.status_code
+        if status == 503:
+            return "Speech model not available"
         if status in (401, 403):
             return "Speech server rejected the key"
         if status is not None:
@@ -83,7 +100,11 @@ class Application(Adw.Application):
         # dictations show over it for a few seconds.
         self._lasting_problem = ""
         self._engine_problem = ""
-        self._engine: Engine | None = None
+        self._engine: Engine | ServerModel | None = None
+        self._screenshots = Screenshots()
+        # Writing to disk must not hold up the paste.
+        self._archive_writer = ThreadPoolExecutor(max_workers=1)
+        self._archive_root = archive.ARCHIVE_PATH
         self._listening = False
         self._problem_timeout = 0
         try:
@@ -151,6 +172,11 @@ class Application(Adw.Application):
             self._restart()
         elif self.config.engine != previous.engine or (
             self.config.engine == "builtin" and self.config.language != previous.language
+        ) or (
+            self.config.engine == "server" and any(
+                getattr(self.config, name) != getattr(previous, name)
+                for name in ("url", "api_key", "admin_key", "model")
+            )
         ):
             self._configure_engine()
 
@@ -165,27 +191,30 @@ class Application(Adw.Application):
         previous, self._engine = self._engine, None
         if previous is not None:
             previous.stop()
+        self._set_engine_problem("")
+        def on_state(state: str) -> None:
+            _on_main_loop(self._engine_changed, engine, state)
+
         if self.config.engine == "server":
-            self._update("engine_state", "server")
-            self._set_engine_problem("")
-            return
-        binary, model = installed_paths()
-        engine = Engine(
-            binary, model, self.config.language,
-            on_state=lambda state: _on_main_loop(self._engine_changed, engine, state),
-        )
+            engine = ServerModel(self.config, on_state)
+        else:
+            binary, model = installed_paths()
+            engine = Engine(binary, model, self.config.language, on_state)
         self._engine = engine
         engine.start()
 
-    def _engine_changed(self, engine: Engine, state: str) -> None:
+    def _engine_changed(self, engine: Engine | ServerModel, state: str) -> None:
         if engine is not self._engine:
             return
         self._update("engine_state", state)
-        problem = {
-            "starting": "Speech engine starting…",
-            "not_installed": "Speech engine not installed — run install.sh",
-            "failed": "Speech engine stopped — check the journal",
-        }.get(state, "")
+        if isinstance(engine, ServerModel):
+            problem = engine.problem
+        else:
+            problem = {
+                "starting": "Speech engine starting…",
+                "not_installed": "Speech engine not installed — run install.sh",
+                "failed": "Speech engine stopped — check the journal",
+            }.get(state, "")
         self._set_engine_problem(problem)
 
     def _start_dictation(self) -> None:
@@ -193,6 +222,7 @@ class Application(Adw.Application):
             Recorder(on_level=lambda level: _on_main_loop(self._emit_level, level)),
             self._transcribe,
             linux.insert_text,
+            capture=self._capture_window,
             cue=self._cue,
             hands_free_key=self.config.hands_free_key,
             on_state=lambda state: _on_main_loop(self._update, "state", state),
@@ -248,18 +278,96 @@ class Application(Adw.Application):
         finally:
             _on_main_loop(setattr, self, "_listening", False)
 
-    def _transcribe(self, wav: bytes) -> str:
+    def _capture_window(self) -> PendingScreenshot | None:
+        """Ask GNOME Shell for the focused window while it is the one dictated into."""
+        if self.config.engine != "server" or not self.config.screenshots:
+            return None
+        request_id, pending = self._screenshots.ask()
+        _on_main_loop(self._request_screenshot, request_id)
+        return pending
+
+    def _request_screenshot(self, request_id: int) -> None:
+        if self._service is not None:
+            self._service.request_screenshot(request_id)
+
+    def screenshot_delivered(self, request_id: int, png: bytes) -> None:
+        self._screenshots.deliver(request_id, png)
+
+    def _transcribe(self, wav: bytes, screenshot: PendingScreenshot | None = None) -> str:
         # Reads self.config per call so changed settings apply without a restart.
         settings = self.config
-        if settings.engine == "builtin":
-            engine = self._engine
-            if engine is None or not engine.wait_ready() or engine.url is None:
-                raise TranscriptionError("unreachable")
-            settings = replace(settings, url=engine.url, api_key="", model="whisper")
-        text = transcribe(wav, settings)
-        if text:
-            _on_main_loop(self._remember, text)
-        return text
+        entry = archive.Entry(
+            started=datetime.now().astimezone(),
+            wav=wav,
+            engine=settings.engine,
+            model=settings.model if settings.engine == "server" else MODEL_NAME,
+            language=settings.language,
+            vocabulary=list(settings.vocabulary),
+        )
+        began = time.monotonic()
+        try:
+            entry.text = self._transcribe_entry(entry, settings, screenshot)
+        except Exception as error:
+            entry.error = _reason(error)
+            raise
+        finally:
+            entry.transcription_seconds = round(time.monotonic() - began, 3)
+            if settings.keep_dictations:
+                self._archive_writer.submit(archive.keep_quietly, entry, self._archive_root)
+        if entry.text:
+            _on_main_loop(self._remember, entry.text)
+        return entry.text
+
+    def _transcribe_entry(
+        self,
+        entry: archive.Entry,
+        settings: config_module.Config,
+        screenshot: PendingScreenshot | None,
+    ) -> str:
+        wav = entry.wav
+        if is_silent(wav):
+            entry.silent = True
+            return ""
+        if settings.engine == "server":
+            transcript, entry.screenshot = self._transcribe_on_server(wav, screenshot)
+            entry.heard, entry.spelled = transcript.heard, transcript.spelled
+            return transcript.text
+        engine = self._engine
+        # The engine changes just after the settings when they are switched.
+        if (
+            engine is None
+            or isinstance(engine, ServerModel)
+            or not engine.wait_ready()
+            or engine.url is None
+        ):
+            raise TranscriptionError("unreachable")
+        settings = replace(settings, url=engine.url, api_key="", model="whisper")
+        entry.heard = transcribe(wav, settings)
+        return entry.heard
+
+    def _transcribe_on_server(
+        self, wav: bytes, screenshot: PendingScreenshot | None
+    ) -> tuple[ChatTranscript, bytes | None]:
+        """The transcript, and the screenshot it was made with."""
+        model = self._engine if isinstance(self._engine, ServerModel) else None
+        if model is not None and model.state != "ready":
+            model.recheck()
+            if not model.wait_ready():
+                raise _ModelUnavailable(model.problem or "Speech model not available")
+        png = screenshot.wait() if screenshot is not None else None
+        # Read after the waiting: the settings may have changed during it.
+        settings = self.config
+        if not settings.screenshots:
+            png = None
+        try:
+            return transcribe_chat(wav, settings, png), png
+        except TranscriptionError as error:
+            # The model may have gone away since it was last seen.
+            if model is not None and (
+                error.status_code in (502, 503, 504) or error.category == "unreachable"
+            ):
+                model.recheck()
+            raise
 
     def _remember(self, text: str) -> None:
         self.recent = [text, *self.recent[:4]]

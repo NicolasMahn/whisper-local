@@ -28,6 +28,22 @@ def loudness(samples: np.ndarray) -> float:
     return max(0.0, min(1.0, (20 * math.log10(rms) + 60) / 50))
 
 
+def is_silent(wav: bytes, threshold: float = 0.3) -> bool:
+    """True when no 20 ms window gets louder than about -45 dBFS.
+
+    Whisper invents text for silence, often by repeating its prompt, so a
+    recording without any sound worth hearing should not reach it at all.
+    Room noise on a typical microphone stays near -55 dBFS; speech is far above.
+    """
+    with wave.open(io.BytesIO(wav)) as recording:
+        window = max(1, recording.getframerate() // 50)
+        samples = np.frombuffer(recording.readframes(recording.getnframes()), "<i2")
+    return all(
+        loudness(samples[start:start + window]) < threshold
+        for start in range(0, samples.size, window)
+    )
+
+
 class Recorder:
     """Records the microphone between start() and stop().
 

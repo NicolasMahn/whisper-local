@@ -52,7 +52,7 @@ def make_dictation(
     cues = []
     transcriptions = []
 
-    def transcribe_wav(wav):
+    def transcribe_wav(wav, _captured):
         transcriptions.append(wav)
         return "hello there" if transcribe is None else transcribe(wav)
 
@@ -186,7 +186,7 @@ def test_paste_waits_until_the_dictation_key_is_up():
     clock = FakeClock()
     jobs, inserted = [], []
     dictation = Dictation(
-        FakeRecorder(), lambda wav: "first", inserted.append, submit=jobs.append, clock=clock
+        FakeRecorder(), lambda wav, _captured: "first", inserted.append, submit=jobs.append, clock=clock
     )
     dictation.pressed()
     clock.now = 0.5
@@ -593,3 +593,29 @@ def test_dedicated_key_during_normal_hold_only_interrupts():
     assert states == ["listening", "idle"]
     assert transcriptions == []
     assert inserted == []
+
+
+def test_each_recording_is_transcribed_with_what_was_captured_as_it_started():
+    clock = FakeClock()
+    jobs, seen = [], []
+    captures = iter(["first window", "second window"])
+    dictation = Dictation(
+        FakeRecorder(),
+        lambda _wav, captured: seen.append(captured) or "",
+        lambda _text: None,
+        submit=jobs.append,
+        clock=clock,
+        capture=lambda: next(captures),
+    )
+
+    dictation.pressed()
+    clock.now = 0.5
+    dictation.released()
+    clock.now = 1
+    dictation.pressed()
+    clock.now = 1.5
+    dictation.released()
+    for job in jobs:
+        job()
+
+    assert seen == ["first window", "second window"]

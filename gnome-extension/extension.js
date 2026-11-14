@@ -3,6 +3,7 @@ import GioUnix from 'gi://GioUnix';
 import GLib from 'gi://GLib';
 import GObject from 'gi://GObject';
 import Pango from 'gi://Pango';
+import Shell from 'gi://Shell';
 import St from 'gi://St';
 
 import * as Main from 'resource:///org/gnome/shell/ui/main.js';
@@ -26,10 +27,17 @@ const INTERFACE_XML = `
     <property name="Recent" type="as" access="read"/>
     <property name="Problem" type="s" access="read"/>
     <signal name="Level"><arg name="level" type="d"/></signal>
+    <signal name="ScreenshotWanted"><arg name="id" type="u"/></signal>
+    <method name="DeliverScreenshot">
+      <arg name="id" type="u" direction="in"/>
+      <arg name="png" type="ay" direction="in"/>
+    </method>
   </interface>
 </node>`;
 
 const WhisperProxy = Gio.DBusProxy.makeProxyWrapper(INTERFACE_XML);
+
+Gio._promisify(Shell.Screenshot.prototype, 'screenshot_window');
 
 const RECENT_COUNT = 5;
 // The app clears a failed transcription's problem after 5 s; a lasting one
@@ -143,6 +151,8 @@ class WhisperButton extends PanelMenu.Button {
                 this._proxySignal = proxy.connect('g-properties-changed', () => this._sync());
                 this._levelSignal = proxy.connectSignal('Level', (_proxy, _sender, [level]) =>
                     this._overlay.setLevel(level));
+                this._screenshotSignal = proxy.connectSignal('ScreenshotWanted', (_proxy, _sender, [id]) =>
+                    this._deliverScreenshot(proxy, id));
             }
             this._sync();
         }, pending, Gio.DBusProxyFlags.GET_INVALIDATED_PROPERTIES);
@@ -168,9 +178,39 @@ class WhisperButton extends PanelMenu.Button {
         if (this._levelSignal)
             this._proxy.disconnectSignal(this._levelSignal);
         this._levelSignal = null;
+        if (this._screenshotSignal)
+            this._proxy.disconnectSignal(this._screenshotSignal);
+        this._screenshotSignal = null;
         this._proxy = null;
         this._problemSeen = undefined;
         this._clearProblemFlash();
+    }
+
+    // Only the shell can capture a window without asking each time, so the app
+    // asks here. It always gets an answer, empty when there is nothing to show.
+    async _deliverScreenshot(proxy, id) {
+        let png = new Uint8Array();
+        try {
+            if (global.display.focus_window) {
+                const stream = Gio.MemoryOutputStream.new_resizable();
+                await new Shell.Screenshot().screenshot_window(false, false, stream);
+                stream.close(null);
+                png = stream.steal_as_bytes().toArray();
+            }
+        } catch (error) {
+            logError(error);
+        }
+        if (this._destroyed || this._proxy !== proxy)
+            return;
+
+        proxy.call('DeliverScreenshot', new GLib.Variant('(uay)', [id, png]),
+            Gio.DBusCallFlags.NONE, -1, null, (source, result) => {
+                try {
+                    source.call_finish(result);
+                } catch (error) {
+                    logError(error);
+                }
+            });
     }
 
     _sync() {

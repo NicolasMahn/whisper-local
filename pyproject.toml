@@ -1,7 +1,7 @@
 [project]
 name = "whisper-local"
 version = "0.1.0"
-description = "GNOME dictation app for Linux, transcribed by Qwen3-ASR on the local network."
+description = "GNOME dictation app for Linux, transcribed by Whisper here or a model that hears on a server."
 requires-python = ">=3.11"
 dependencies = [
     "numpy",

@@ -51,6 +51,9 @@ ENGINE_STATUS = {
     "not_installed": "Not installed",
     "failed": "Unavailable",
     "stopped": "Starting…",
+    "checking": "Checking…",
+    "off": "Not running",
+    "unreachable": "Unavailable",
 }
 
 
@@ -170,8 +173,18 @@ class Window(Adw.ApplicationWindow):
             "notify::active", lambda row, _: self._app.change_settings(sounds=row.get_active())
         )
 
+        keep_row = Adw.SwitchRow(
+            title="Keep dictations on this computer",
+            subtitle="Audio, screenshots and text, in ~/.local/share/whisper-local/dictations",
+            active=config.keep_dictations,
+        )
+        keep_row.connect(
+            "notify::active",
+            lambda row, _: self._app.change_settings(keep_dictations=row.get_active()),
+        )
+
         group = Adw.PreferencesGroup()
-        for row in (key_row, hands_free_row, language_row, sounds_row):
+        for row in (key_row, hands_free_row, language_row, sounds_row, keep_row):
             group.add(row)
         return group
 
@@ -201,6 +214,23 @@ class Window(Adw.ApplicationWindow):
         )
         self._api_key_row.connect("apply", self._api_key_applied)
         group.add(self._api_key_row)
+        self._admin_key_row = Adw.PasswordEntryRow(
+            title="Admin key, to start the model", text=self._app.config.admin_key,
+            show_apply_button=True,
+        )
+        self._admin_key_row.connect(
+            "apply", lambda row: self._app.change_settings(admin_key=row.get_text())
+        )
+        group.add(self._admin_key_row)
+        self._screenshots_row = Adw.SwitchRow(
+            title="Send a screenshot of the window you dictate into",
+            active=self._app.config.screenshots,
+        )
+        self._screenshots_row.connect(
+            "notify::active",
+            lambda row, _: self._app.change_settings(screenshots=row.get_active()),
+        )
+        group.add(self._screenshots_row)
 
         self._known_row = Adw.ActionRow(
             title="Known words",
@@ -219,9 +249,9 @@ class Window(Adw.ApplicationWindow):
         builtin = self._app.config.engine == "builtin"
         self._server_row.set_visible(not builtin)
         self._api_key_row.set_visible(not builtin)
-        self._engine_row.set_subtitle(
-            ENGINE_STATUS.get(self._app.engine_state, "Starting…") if builtin else ""
-        )
+        self._admin_key_row.set_visible(not builtin)
+        self._screenshots_row.set_visible(not builtin)
+        self._engine_row.set_subtitle(ENGINE_STATUS.get(self._app.engine_state, "Starting…"))
 
     def _show_known_words(self) -> None:
         for row in self._known_rows:

@@ -14,6 +14,11 @@ _XML = f"""
     <property name="Recent" type="as" access="read"/>
     <property name="Problem" type="s" access="read"/>
     <signal name="Level"><arg name="level" type="d"/></signal>
+    <signal name="ScreenshotWanted"><arg name="id" type="u"/></signal>
+    <method name="DeliverScreenshot">
+      <arg name="id" type="u" direction="in"/>
+      <arg name="png" type="ay" direction="in"/>
+    </method>
   </interface>
 </node>
 """
@@ -36,7 +41,7 @@ class Service:
         self._connection = connection
         interface = Gio.DBusNodeInfo.new_for_xml(_XML).interfaces[0]
         self._registration = connection.register_object(
-            OBJECT_PATH, interface, None, self._get, self._set
+            OBJECT_PATH, interface, self._call, self._get, self._set
         )
         self._notify = application.connect("notify", self._changed)
 
@@ -48,6 +53,35 @@ class Service:
         self._connection.emit_signal(
             None, OBJECT_PATH, INTERFACE, "Level", GLib.Variant("(d)", (level,))
         )
+
+    def request_screenshot(self, request_id: int) -> None:
+        self._connection.emit_signal(
+            None, OBJECT_PATH, INTERFACE, "ScreenshotWanted", GLib.Variant("(u)", (request_id,))
+        )
+
+    def _call(self, _connection, sender, _path, _interface, _method, parameters, invocation):
+        # DeliverScreenshot is the only method. What it delivers goes to a model
+        # whose answer is typed, so only GNOME Shell may deliver.
+        if self._is_shell(sender):
+            self._application.screenshot_delivered(
+                parameters.get_child_value(0).get_uint32(),
+                # Unpacking would make a Python int of every byte of the picture.
+                parameters.get_child_value(1).get_data_as_bytes().get_data() or b"",
+            )
+            invocation.return_value(None)
+        else:
+            invocation.return_dbus_error(f"{INTERFACE}.Denied", "Only GNOME Shell delivers these")
+
+    def _is_shell(self, sender: str) -> bool:
+        try:
+            owner = self._connection.call_sync(
+                "org.freedesktop.DBus", "/org/freedesktop/DBus", "org.freedesktop.DBus",
+                "GetNameOwner", GLib.Variant("(s)", ("org.gnome.Shell",)),
+                GLib.VariantType("(s)"), Gio.DBusCallFlags.NONE, 1000, None,
+            )
+        except GLib.Error:
+            return False
+        return owner.unpack()[0] == sender
 
     def _variant(self, name: str) -> GLib.Variant:
         prop, kind = _PROPERTIES[name]

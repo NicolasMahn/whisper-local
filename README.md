@@ -20,13 +20,35 @@ A Vulkan-capable GPU is recommended. Without one, whisper.cpp runs on the CPU,
 which is much slower: a CPU engine took about 3 s per dictation on the same
 machine.
 
-Instead of the built-in engine you can choose "Server" and send each
-recording to any OpenAI-compatible `/v1/audio/transcriptions` endpoint, on this
-computer or another one. For example, Qwen3-ASR with vLLM:
+Instead of the built-in engine you can choose "Server" and send each recording
+to a chat model that hears, on this computer or another one, through an
+OpenAI-compatible `/v1/chat/completions`. The author runs `qwen3-omni-30b` on
+[local_llm](https://github.com/NicolasMahn/local_llm). A dictation comes back in
+about 1 to 2 s, 87 s of speech in 8 to 20 s. Set the URL and API key in the
+window, the model name in the settings. A server that only offers
+`/v1/audio/transcriptions` no longer works here.
 
-    vllm serve Qwen/Qwen3-ASR-1.7B --served-model-name qwen3-asr
+The model also gets a screenshot of the window you dictate into, taken as you
+press the key, so it can spell what is on your screen: it heard a spoken "Jev"
+as "Jeff" until it could read the name. The top-bar extension takes it, because
+on Wayland only GNOME Shell can capture a window without asking each time.
 
-Set its URL and optional API key in the window, the model name in the settings.
+Text on a screen can be written by anyone, and the answer gets typed into your
+window. In tests, a web page's text could otherwise make the model write out a
+command. So the recording is also sent without the screenshot, which no picture
+can influence, and that answer is what gets typed. From the screenshot's answer,
+only words it writes the same or nearly the same way are swapped in: "Jeff"
+becomes "Jev", "whisper local" becomes "whisper-local". Added words and symbols
+are dropped. What remains is that a picture can change a word into a similar
+one. Line breaks and control characters are removed, so an answer cannot press
+Enter in a terminal.
+
+With an admin key, the app starts a model that is off on a local_llm server: when
+the app starts and when you dictate. Starting takes minutes; the pill says so,
+and what you dictate in that time is not kept, because pasting it minutes later
+could put it in the wrong window. If the model only fits after stopping others, the app names them and leaves them
+running, because they may be someone's work. Without an admin key it only reports
+that the model is off.
 
 ## Installing
 
@@ -62,7 +84,8 @@ Then run `./install.sh`; it sees the binary and does the rest.
 `./uninstall.sh` removes it all and keeps your settings. It asks before
 deleting the model and binary; `--yes` deletes them without asking.
 
-Log out and back in once, so GNOME Shell loads the new extension. On a
+Log out and back in once, so GNOME Shell loads the new extension. The same goes
+after pulling changes to it: until then, dictation works without screenshots. On a
 computer with only one user account, GNOME hides Log Out from the system menu;
 run `gnome-session-quit --logout` instead.
 
@@ -98,6 +121,10 @@ in normal text fields.
 - The microphone is open only while recording, so the system's microphone
   indicator shows when it listens.
 
+A recording without sound worth hearing types nothing, and neither does an answer
+made only of your known words: models tend to invent those from silence. So saying
+just "Qwen" and nothing else types nothing.
+
 Opening the microphone takes about 80 ms, which can cut off the first
 syllable; start speaking just after the tone.
 
@@ -109,14 +136,17 @@ creating it with mode `0600`. If you create the file by hand, run
 
 | Setting | Default | Meaning |
 | --- | --- | --- |
-| `engine` | `"builtin"` | `"builtin"` runs Whisper here; `"server"` uses the three settings below |
+| `engine` | `"builtin"` | `"builtin"` runs Whisper here; `"server"` uses the settings below |
 | `url` | `"http://localhost:8000/v1"` | Server only: the speech server, up to and including `/v1` |
 | `api_key` | `""` | Server only: sent as a Bearer token; `WHISPER_LOCAL_API_KEY` is used when the setting is absent |
-| `model` | `"qwen3-asr"` | Server only: the model name the server expects |
+| `admin_key` | `""` | Server only: lets the app start the model on a local_llm server. Sent only to `/admin/`, and only over HTTPS or on this computer |
+| `model` | `"qwen3-omni-30b"` | Server only: the model name the server expects |
+| `screenshots` | `true` | Server only: send a screenshot of the window you dictate into |
 | `key` | `"right_ctrl"` | The dictation key |
 | `hands_free_key` | `""` | Empty: double-tap the dictation key; or a different key |
 | `language` | `""` | Empty: the model detects it; `"en"`, `"de"`, ... forces one |
 | `sounds` | `true` | Play the tones |
+| `keep_dictations` | `false` | Save every recording, its screenshot and the transcripts, for measuring and tuning later |
 | `vocabulary` | `[]` | Known names and terms sent as context, e.g. `["Nicolas Mahn", "Qwen", "DRY"]` |
 
 Keys are `right_ctrl`, `right_alt`, `right_cmd` (Right Super), `right_shift`,
@@ -133,12 +163,27 @@ without a restart.
   listens only on 127.0.0.1.
 - With a server, audio goes only to the URL you configure, and nowhere else.
   Over plain HTTP on a network, anyone else on that network can read the audio,
-  the transcripts and the API key. Use HTTPS, or keep the server on the same
+  the screenshots, the transcripts and the API key. Use HTTPS, or keep the server on the same
   machine, if that matters to you.
+- With a server and `screenshots` on, each dictation also sends a picture of the
+  focused window to that URL, whatever it shows: a password manager, a bank, a
+  private chat. Turn it off in the window when that matters. Screenshots are
+  kept in memory only, unless `keep_dictations` is on. Only GNOME Shell may
+  deliver one to the app; another
+  program pretending to be the app could ask the extension for one, but programs
+  running as you can already read your keystrokes (see above).
 - Keyboard access lets every program running as you read your
   keystrokes (see above).
-- Transcripts are kept in memory only and never written to disk. The last one
-  stays on the clipboard, replacing what was there.
+- Unless `keep_dictations` is on, recordings, screenshots and transcripts are
+  kept in memory only and never written to disk. The last transcript stays on
+  the clipboard, replacing what was there.
+- With `keep_dictations` on, each dictation gets its own folder in
+  `~/.local/share/whisper-local/dictations`, readable only by you:
+  `audio.wav`, `screenshot.png` when one was sent, and `dictation.json` with
+  the settings, the model's answers with and without the screenshot, what was
+  typed, any error and the timings. Those screenshots show whatever was on
+  screen, so treat the folder like the passwords and chats it may contain.
+  Nothing is ever deleted; remove old folders yourself.
 
 ## Development
 
@@ -146,8 +191,8 @@ without a restart.
     uv run pytest
 
 The tests cover press, release, cancel, hands-free, audio levels, WAV encoding,
-the config, the request to the server and the engine's start, restart and
-stop. Check the GNOME window, extension
+the config, the requests to the server, starting a model on it, and the engine's
+start, restart and stop. Check the GNOME window, extension
 and pill by hand after changing them.
 
 ## License

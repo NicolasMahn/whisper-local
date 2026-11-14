@@ -3,6 +3,7 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from typing import Any
 
 
 def _print_error(error: Exception) -> None:
@@ -17,6 +18,10 @@ class Dictation:
     worker: transcripts are inserted in the order they were spoken, and
     pending ones die with the process instead of pasting after quitting.
 
+    `capture` runs as each recording starts, for what can only be known then,
+    such as the window being dictated into; `transcribe` gets its result along
+    with the recording.
+
     `on_state` hears "listening", "hands_free", "transcribing" or "idle"
     whenever that changes. `on_error` hears every failure. Both may be called
     from any thread, so a UI must hand them over to its own main loop.
@@ -25,7 +30,7 @@ class Dictation:
     def __init__(
         self,
         recorder,
-        transcribe: Callable[[bytes], str],
+        transcribe: Callable[[bytes, Any], str],
         insert_text: Callable[[str], None],
         cue: Callable[[str], None] = lambda name: None,
         submit: Callable[[Callable[[], None]], None] | None = None,
@@ -34,9 +39,12 @@ class Dictation:
         on_state: Callable[[str], None] = lambda state: None,
         on_error: Callable[[Exception], None] = _print_error,
         hands_free_key: str = "",
+        capture: Callable[[], Any] = lambda: None,
     ):
         self._recorder = recorder
         self._transcribe = transcribe
+        self._capture = capture
+        self._captured: Any = None
         self._insert_text = insert_text
         self._cue = cue
         self._submit = submit or _start_worker()
@@ -107,6 +115,7 @@ class Dictation:
         except Exception as error:
             self._fail(error)
             return
+        self._captured = self._capture()
         self._started_at = now
         self._hands_free = hands_free
         self._report_state()
@@ -152,9 +161,7 @@ class Dictation:
             if not self._dedicated_hands_free:
                 self._last_tap_at = self._clock()
             return
-        self._stop_recording(pending=1)
-        self._cue("stop")
-        self._submit(lambda: self._transcribe_and_insert(wav))
+        self._submit_recording(wav)
 
     def _finish_recording(self) -> None:
         try:
@@ -163,18 +170,23 @@ class Dictation:
             self._stop_recording()
             self._fail(error)
             return
+        self._submit_recording(wav)
+
+    def _submit_recording(self, wav: bytes) -> None:
+        captured = self._captured
         self._stop_recording(pending=1)
         self._cue("stop")
-        self._submit(lambda: self._transcribe_and_insert(wav))
+        self._submit(lambda: self._transcribe_and_insert(wav, captured))
 
     def _stop_recording(self, pending: int = 0) -> None:
+        self._captured = None
         self._started_at = None
         self._hands_free = False
         self._report_state(pending)
 
-    def _transcribe_and_insert(self, wav: bytes) -> None:
+    def _transcribe_and_insert(self, wav: bytes, captured: Any) -> None:
         try:
-            text = self._transcribe(wav)
+            text = self._transcribe(wav, captured)
             if text:
                 self._key_up.wait()
                 self._insert_text(text)

@@ -11,38 +11,35 @@ from whisper_local.transcribe import ChatTranscript, TranscriptionError
 STARTED = datetime(2026, 11, 15, 14, 3, 22, 123456, timezone(timedelta(hours=1)))
 
 
-def entry(**changes) -> archive.Entry:
-    values = dict(
-        started=STARTED, wav=bytes(44 + 32_000 * 2), engine="server", model="omni",
-        language="", vocabulary=["Qwen"],
+def test_keeps_audio_screenshot_and_record_in_one_private_folder(tmp_path):
+    settings = config.Config(engine="server", api_key="secret", admin_key="admin")
+    entry = archive.Entry(
+        recorded_at=STARTED, wav=bytes(44 + 32_000 * 2), settings=settings, model="omni",
+        screenshot=b"png", heard="Ask Jeff", spelled="Ask Jev", text="Ask Jev",
     )
-    return archive.Entry(**{**values, **changes})
 
-
-def test_keeps_audio_screenshot_and_answers_in_one_private_folder(tmp_path):
-    kept = entry(screenshot=b"png", heard="Ask Jeff", spelled="Ask Jev", text="Ask Jev")
-
-    folder = archive.keep(kept, tmp_path / "dictations")
+    folder = archive.keep(entry, tmp_path / "dictations")
 
     assert folder.name == "2026-11-15T14:03:22.123456+01:00"
     assert (folder.parent.stat().st_mode & 0o777) == 0o700
-    assert (folder / "audio.wav").read_bytes() == kept.wav
+    assert (folder / "audio.wav").read_bytes() == entry.wav
     assert (folder / "screenshot.png").read_bytes() == b"png"
-    assert json.loads((folder / "dictation.json").read_text()) == {
-        "started": "2026-11-15T14:03:22.123456+01:00",
-        "audio_seconds": 2.0,
-        "transcription_seconds": None,
-        "engine": "server",
-        "model": "omni",
-        "language": "",
-        "vocabulary": ["Qwen"],
-        "screenshot": True,
-        "silent": False,
-        "heard": "Ask Jeff",
-        "spelled": "Ask Jev",
-        "text": "Ask Jev",
-        "error": None,
-    }
+    text = (folder / "dictation.json").read_text()
+    assert "secret" not in text and "admin" not in text
+    record = json.loads(text)
+    assert record["format"] == archive.FORMAT
+    assert record["version"] == archive.version()
+    assert record["settings"]["model"] == "omni"
+    assert record["settings"]["screenshots"] is True
+    assert record["audio_seconds"] == 2.0
+    assert (record["heard"], record["spelled"], record["text"]) == ("Ask Jeff", "Ask Jev", "Ask Jev")
+
+
+def test_version_names_the_commit_of_a_checkout():
+    found = archive.version()
+
+    assert found["whisper_local"]
+    assert found["commit"] is None or len(found["commit"]) == 12
 
 
 def server_app(monkeypatch, tmp_path, transcribe_chat, **settings):
@@ -56,11 +53,12 @@ def server_app(monkeypatch, tmp_path, transcribe_chat, **settings):
     return app
 
 
-def screenshot(png: bytes):
+def recording(png: bytes | None = None):
     screenshots = Screenshots()
     request_id, pending = screenshots.ask()
-    screenshots.deliver(request_id, png)
-    return pending
+    if png is not None:
+        screenshots.deliver(request_id, png)
+    return gnome_app._Recording(STARTED, pending if png is not None else None)
 
 
 def kept(app, tmp_path) -> list[dict]:
@@ -71,19 +69,26 @@ def kept(app, tmp_path) -> list[dict]:
     ]
 
 
-def test_dictation_is_kept_with_both_answers(monkeypatch, tmp_path):
+def test_dictation_is_kept_only_after_its_paste(monkeypatch, tmp_path):
     app = server_app(
         monkeypatch, tmp_path,
-        lambda wav, settings, png: ChatTranscript("Ask Jev", "Ask Jeff", "Ask Jev"),
+        lambda wav, settings, png: ChatTranscript(
+            "Ask Jev", "Ask Jeff", "Ask Jev", heard_seconds=1.5, spelled_seconds=1.7,
+        ),
         keep_dictations=True,
     )
+    started = recording(b"png")
 
-    assert app._transcribe(b"wav", screenshot(b"png")) == "Ask Jev"
+    assert app._transcribe(b"wav", started) == "Ask Jev"
+    assert list(tmp_path.iterdir()) == []
+    app._finished(started, 0.25, 0.05)
 
     [record] = kept(app, tmp_path)
     assert (record["heard"], record["spelled"], record["text"]) == ("Ask Jeff", "Ask Jev", "Ask Jev")
-    assert record["screenshot"] is True
-    assert record["error"] is None
+    assert record["screenshot_sent"] is True
+    assert record["seconds"]["heard"] == 1.5
+    assert record["seconds"]["spelled"] == 1.7
+    assert (record["seconds"]["key_release_wait"], record["seconds"]["paste"]) == (0.25, 0.05)
     [folder] = tmp_path.iterdir()
     assert (folder / "screenshot.png").read_bytes() == b"png"
 
@@ -93,9 +98,11 @@ def test_failed_dictation_is_kept_with_its_reason(monkeypatch, tmp_path):
         raise TranscriptionError("unreachable")
 
     app = server_app(monkeypatch, tmp_path, fail, keep_dictations=True)
+    started = recording()
 
     with pytest.raises(TranscriptionError):
-        app._transcribe(b"wav")
+        app._transcribe(b"wav", started)
+    app._finished(started, 0, 0)
 
     [record] = kept(app, tmp_path)
     assert record["error"] == "Speech server unreachable"
@@ -104,7 +111,9 @@ def test_failed_dictation_is_kept_with_its_reason(monkeypatch, tmp_path):
 
 def test_nothing_is_kept_unless_asked(monkeypatch, tmp_path):
     app = server_app(monkeypatch, tmp_path, lambda wav, settings, png: ChatTranscript("hi", "hi"))
+    started = recording(b"png")
 
-    app._transcribe(b"wav", screenshot(b"png"))
+    app._transcribe(b"wav", started)
+    app._finished(started, 0, 0)
 
     assert kept(app, tmp_path) == []

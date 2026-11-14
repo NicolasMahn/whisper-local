@@ -2,11 +2,13 @@ import base64
 import http.client
 import json
 import re
+import time
 import urllib.error
 import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import TimeoutError as FutureTimeout
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -18,6 +20,11 @@ _WAV_BYTES_PER_SECOND = 32_000
 # Close enough for "Jeff" and "Jev" (0.57), not for "deploy" and "delete" (0.5).
 _SIMILAR_WORD = 0.55
 _WORD = re.compile(r"\w+(?:-\w+)*")
+# Once the audio's answer is in, how long the screenshot's may still take.
+# Without a limit, a screenshot answer that copies text off the screen held up
+# the paste for 9 s on a 1.5 s recording.
+_SPELLING_GRACE = 0.5
+_SPELLING_GRACE_SHARE = 0.2
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 # Tested against qwen3-omni-30b. The screenshot sits in its own, already
@@ -51,8 +58,12 @@ class ChatTranscript:
 
     text: str
     heard: str
-    # The answer with the screenshot; None without one, or when that request failed.
+    # The answer with the screenshot; None without one, or when it was not used.
     spelled: str | None = None
+    heard_seconds: float | None = None
+    spelled_seconds: float | None = None
+    # Why the screenshot's answer was not used, such as "too slow".
+    spelled_error: str | None = None
 
 
 class TranscriptionError(Exception):
@@ -177,7 +188,7 @@ def _chat_text(payload: bytes) -> str | None:
         choice = json.loads(payload)["choices"][0]
         # Hitting the limit means the model ran away, not that someone spoke this much.
         if choice.get("finish_reason") == "length":
-            return None
+            raise TranscriptionError("ran on")
         # A line break could press Enter in a terminal the text is pasted into,
         # and an escape character could do anything else there.
         text = choice["message"]["content"]
@@ -256,19 +267,44 @@ def transcribe_chat(
     a recording without speech, the model wrote out a command it read in the
     picture. So the model also hears the recording alone, which no picture can
     influence, and the screenshot may only change the spelling of those words.
-    Both run at once, so this costs little time.
+    Both run at once, but they share the model, so each is slower than one
+    alone. The paste waits for the screenshot's answer only briefly after the
+    audio's; a late one is dropped and its request left to finish by itself.
     """
+    began = time.monotonic()
     if not screenshot:
         heard = _ask_chat(wav, config, None)
-        return ChatTranscript(heard, heard)
-    with ThreadPoolExecutor(max_workers=1) as pool:
+        return ChatTranscript(heard, heard, heard_seconds=_since(began))
+    pool = ThreadPoolExecutor(max_workers=1)
+    try:
         with_screenshot = pool.submit(_ask_chat, wav, config, screenshot)
         heard = _ask_chat(wav, config, None)
+        heard_seconds = _since(began)
         try:
-            spelled = with_screenshot.result()
-        except TranscriptionError:
-            return ChatTranscript(heard, heard)
-    return ChatTranscript(_respell(heard, spelled), heard, spelled)
+            spelled = with_screenshot.result(
+                timeout=_SPELLING_GRACE + _SPELLING_GRACE_SHARE * heard_seconds
+            )
+        except FutureTimeout:
+            return ChatTranscript(heard, heard, None, heard_seconds, None, "too slow")
+        except TranscriptionError as error:
+            return ChatTranscript(
+                heard, heard, None, heard_seconds, _since(began), _describe(error)
+            )
+    finally:
+        pool.shutdown(wait=False)
+    return ChatTranscript(
+        _respell(heard, spelled), heard, spelled, heard_seconds, _since(began)
+    )
+
+
+def _since(began: float) -> float:
+    return round(time.monotonic() - began, 3)
+
+
+def _describe(error: TranscriptionError) -> str:
+    if error.status_code is None:
+        return error.category
+    return f"{error.category} {error.status_code}"
 
 
 def server_status(config: Config, timeout: float = 3) -> str:

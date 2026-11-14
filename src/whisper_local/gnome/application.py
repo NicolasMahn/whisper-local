@@ -5,7 +5,7 @@ import threading
 import time
 import tomllib
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from datetime import datetime
 
 import sounddevice as sd
@@ -43,6 +43,16 @@ def _on_main_loop(function, *args) -> None:
     GLib.idle_add(run)
 
 
+@dataclass
+class _Recording:
+    """What a recording carries from its start to after its paste."""
+
+    started: datetime
+    screenshot: PendingScreenshot | None = None
+    # Filled in during transcription when the dictation is to be kept.
+    entry: archive.Entry | None = None
+
+
 class _ModelUnavailable(Exception):
     """The server's model cannot take this dictation; says why."""
 
@@ -59,6 +69,8 @@ def _reason(error: Exception) -> str:
             return "Speech server rejected the key"
         if status is not None:
             return "Speech server failed"
+        if error.category == "ran on":
+            return "Speech model's answer ran too long"
         if error.category == "unexpected response":
             return "Speech server sent an unexpected response"
         if error.category == "redirect rejected":
@@ -105,6 +117,8 @@ class Application(Adw.Application):
         # Writing to disk must not hold up the paste.
         self._archive_writer = ThreadPoolExecutor(max_workers=1)
         self._archive_root = archive.ARCHIVE_PATH
+        # The version of the code this process loaded, not of a later checkout.
+        self._archive_writer.submit(archive.version)
         self._listening = False
         self._problem_timeout = 0
         try:
@@ -222,7 +236,8 @@ class Application(Adw.Application):
             Recorder(on_level=lambda level: _on_main_loop(self._emit_level, level)),
             self._transcribe,
             linux.insert_text,
-            capture=self._capture_window,
+            capture=self._capture,
+            finished=self._finished,
             cue=self._cue,
             hands_free_key=self.config.hands_free_key,
             on_state=lambda state: _on_main_loop(self._update, "state", state),
@@ -278,13 +293,13 @@ class Application(Adw.Application):
         finally:
             _on_main_loop(setattr, self, "_listening", False)
 
-    def _capture_window(self) -> PendingScreenshot | None:
-        """Ask GNOME Shell for the focused window while it is the one dictated into."""
-        if self.config.engine != "server" or not self.config.screenshots:
-            return None
-        request_id, pending = self._screenshots.ask()
-        _on_main_loop(self._request_screenshot, request_id)
-        return pending
+    def _capture(self) -> _Recording:
+        recording = _Recording(started=datetime.now().astimezone())
+        if self.config.engine == "server" and self.config.screenshots:
+            # The focused window now is the one dictated into.
+            request_id, recording.screenshot = self._screenshots.ask()
+            _on_main_loop(self._request_screenshot, request_id)
+        return recording
 
     def _request_screenshot(self, request_id: int) -> None:
         if self._service is not None:
@@ -293,30 +308,38 @@ class Application(Adw.Application):
     def screenshot_delivered(self, request_id: int, png: bytes) -> None:
         self._screenshots.deliver(request_id, png)
 
-    def _transcribe(self, wav: bytes, screenshot: PendingScreenshot | None = None) -> str:
+    def _transcribe(self, wav: bytes, recording: _Recording | None = None) -> str:
         # Reads self.config per call so changed settings apply without a restart.
         settings = self.config
+        recording = recording or _Recording(started=datetime.now().astimezone())
         entry = archive.Entry(
-            started=datetime.now().astimezone(),
+            recorded_at=recording.started,
             wav=wav,
-            engine=settings.engine,
+            settings=settings,
             model=settings.model if settings.engine == "server" else MODEL_NAME,
-            language=settings.language,
-            vocabulary=list(settings.vocabulary),
         )
+        if settings.keep_dictations:
+            recording.entry = entry
         began = time.monotonic()
         try:
-            entry.text = self._transcribe_entry(entry, settings, screenshot)
+            entry.text = self._transcribe_entry(entry, settings, recording.screenshot)
         except Exception as error:
             entry.error = _reason(error)
             raise
         finally:
-            entry.transcription_seconds = round(time.monotonic() - began, 3)
-            if settings.keep_dictations:
-                self._archive_writer.submit(archive.keep_quietly, entry, self._archive_root)
+            entry.seconds["transcription"] = round(time.monotonic() - began, 3)
         if entry.text:
             _on_main_loop(self._remember, entry.text)
         return entry.text
+
+    def _finished(self, recording: _Recording, waited: float, pasted: float) -> None:
+        """Keep the dictation, now that nothing waits for it any more."""
+        entry = recording.entry
+        if entry is None:
+            return
+        entry.seconds["key_release_wait"] = round(waited, 3)
+        entry.seconds["paste"] = round(pasted, 3)
+        self._archive_writer.submit(archive.keep_quietly, entry, self._archive_root)
 
     def _transcribe_entry(
         self,
@@ -329,8 +352,11 @@ class Application(Adw.Application):
             entry.silent = True
             return ""
         if settings.engine == "server":
-            transcript, entry.screenshot = self._transcribe_on_server(wav, screenshot)
+            transcript, entry.screenshot = self._transcribe_on_server(wav, screenshot, entry)
             entry.heard, entry.spelled = transcript.heard, transcript.spelled
+            entry.spelled_error = transcript.spelled_error
+            entry.seconds["heard"] = transcript.heard_seconds
+            entry.seconds["spelled"] = transcript.spelled_seconds
             return transcript.text
         engine = self._engine
         # The engine changes just after the settings when they are switched.
@@ -346,7 +372,7 @@ class Application(Adw.Application):
         return entry.heard
 
     def _transcribe_on_server(
-        self, wav: bytes, screenshot: PendingScreenshot | None
+        self, wav: bytes, screenshot: PendingScreenshot | None, entry: archive.Entry
     ) -> tuple[ChatTranscript, bytes | None]:
         """The transcript, and the screenshot it was made with."""
         model = self._engine if isinstance(self._engine, ServerModel) else None
@@ -354,7 +380,9 @@ class Application(Adw.Application):
             model.recheck()
             if not model.wait_ready():
                 raise _ModelUnavailable(model.problem or "Speech model not available")
+        began = time.monotonic()
         png = screenshot.wait() if screenshot is not None else None
+        entry.seconds["screenshot_wait"] = round(time.monotonic() - began, 3)
         # Read after the waiting: the settings may have changed during it.
         settings = self.config
         if not settings.screenshots:

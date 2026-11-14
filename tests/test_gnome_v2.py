@@ -1,4 +1,4 @@
-from gi.repository import Gio
+from gi.repository import Gio, GLib
 
 from whisper_local import config
 from whisper_local.gnome import application as gnome_app
@@ -19,7 +19,7 @@ def test_dbus_interface_exposes_properties_and_level_signal():
         "Recent": "as",
         "Problem": "s",
     }
-    assert signals == {"Level": ["d"]}
+    assert signals == {"Level": ["d"], "ScreenshotWanted": ["u"]}
 
 
 def test_application_exposes_and_listens_for_configured_hands_free_key(monkeypatch):
@@ -110,14 +110,18 @@ def test_known_words_edits_save_current_list_without_restarting(monkeypatch):
 
 def test_application_transcribes_with_current_vocabulary(monkeypatch):
     calls = []
+    monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
     monkeypatch.setattr(
-        gnome_app, "transcribe", lambda wav, settings: calls.append(settings.vocabulary.copy()) or ""
+        gnome_app, "transcribe_chat",
+        lambda wav, settings, png: calls.append(settings.vocabulary.copy()) or "",
     )
-    app = type("App", (), {"config": config.Config(engine="server", vocabulary=["Qwen"])})()
+    monkeypatch.setattr(gnome_app.config_module, "load", config.Config)
+    app = gnome_app.Application()
+    app.config = config.Config(engine="server", vocabulary=["Qwen"])
 
-    gnome_app.Application._transcribe(app, b"wav")
+    app._transcribe(b"wav")
     app.config = config.Config(engine="server", vocabulary=["Nicolas Mahn"])
-    gnome_app.Application._transcribe(app, b"wav")
+    app._transcribe(b"wav")
 
     assert calls == [["Qwen"], ["Nicolas Mahn"]]
 
@@ -131,3 +135,45 @@ def test_failure_log_omits_exception_text(monkeypatch, capsys):
     app._failed(error)
 
     assert capsys.readouterr().err == "whisper-local: Could not paste the text\n"
+
+
+class FakeInvocation:
+    def __init__(self):
+        self.returned = False
+        self.error = None
+
+    def return_value(self, _value):
+        self.returned = True
+
+    def return_dbus_error(self, name, _message):
+        self.error = name
+
+
+def delivery_to_service(sender, shell_owner):
+    delivered = []
+    view = service.Service.__new__(service.Service)
+    view._application = type("App", (), {
+        "screenshot_delivered": lambda _self, request_id, png: delivered.append((request_id, png)),
+    })()
+    view._connection = type("Connection", (), {
+        "call_sync": lambda _self, *_args: GLib.Variant("(s)", (shell_owner,)),
+    })()
+    invocation = FakeInvocation()
+    parameters = GLib.Variant("(uay)", (7, [1, 2, 3]))
+    view._call(None, sender, None, None, "DeliverScreenshot", parameters, invocation)
+    return delivered, invocation
+
+
+def test_screenshot_is_accepted_from_gnome_shell():
+    delivered, invocation = delivery_to_service(":1.5", shell_owner=":1.5")
+
+    assert delivered == [(7, bytes([1, 2, 3]))]
+    assert invocation.returned
+
+
+def test_screenshot_is_refused_from_any_other_program():
+    # The model's answer gets typed, so a planted picture could type anything.
+    delivered, invocation = delivery_to_service(":1.99", shell_owner=":1.5")
+
+    assert delivered == []
+    assert invocation.error

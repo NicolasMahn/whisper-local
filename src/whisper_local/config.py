@@ -15,7 +15,10 @@ class Config:
     engine: str = "builtin"
     url: str = "http://localhost:8000/v1"
     api_key: str = ""
-    model: str = "qwen3-asr"
+    # Lets the app start the model on a local_llm server; only sent to /admin/.
+    admin_key: str = ""
+    model: str = "qwen3-omni-30b"
+    screenshots: bool = True
     key: str = "right_alt" if sys.platform == "darwin" else "right_ctrl"
     hands_free_key: str = ""
     # Empty lets the model detect the language; "en", "de", ... forces one.

@@ -1,9 +1,14 @@
 from dataclasses import replace
 from types import SimpleNamespace
 
+import numpy as np
+import pytest
+
 from whisper_local import config
 from whisper_local.gnome import application as gnome_app
 from whisper_local.gnome.window import ENGINE_STATUS, Window
+from whisper_local.recorder import to_wav
+from whisper_local.screenshots import Screenshots
 
 
 def test_builtin_transcription_uses_local_url_without_server_credentials(monkeypatch):
@@ -18,6 +23,7 @@ def test_builtin_transcription_uses_local_url_without_server_credentials(monkeyp
         "wait_ready": lambda self: True,
     })()
     calls = []
+    monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
     monkeypatch.setattr(
         gnome_app, "transcribe", lambda wav, chosen: calls.append((wav, chosen)) or ""
     )
@@ -42,11 +48,17 @@ def test_server_transcription_preserves_model_and_credentials(monkeypatch):
     monkeypatch.setattr(gnome_app.config_module, "load", lambda: settings)
     app = gnome_app.Application()
     calls = []
-    monkeypatch.setattr(gnome_app, "transcribe", lambda wav, chosen: calls.append(chosen) or "")
+    monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
+    monkeypatch.setattr(
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append((chosen, png)) or ""
+    )
+    screenshots = Screenshots()
+    request_id, pending = screenshots.ask()
+    screenshots.deliver(request_id, b"png")
 
-    app._transcribe(b"wav")
+    app._transcribe(b"wav", pending)
 
-    assert calls == [settings]
+    assert calls == [(settings, b"png")]
 
 
 def test_engine_switch_stops_child_and_updates_lasting_problem(monkeypatch):
@@ -67,6 +79,15 @@ def test_engine_switch_stops_child_and_updates_lasting_problem(monkeypatch):
             self.stopped = True
 
     monkeypatch.setattr(gnome_app, "Engine", FakeEngine)
+    models = []
+
+    class FakeServerModel(FakeEngine, gnome_app.ServerModel):
+        def __init__(self, settings, on_state):
+            FakeEngine.__init__(self, None, None, None, on_state)
+            engines.pop()
+            models.append(self)
+
+    monkeypatch.setattr(gnome_app, "ServerModel", FakeServerModel)
     monkeypatch.setattr(gnome_app, "installed_paths", lambda: ("binary", "model"))
     monkeypatch.setattr(
         gnome_app.config_module, "save",
@@ -85,9 +106,12 @@ def test_engine_switch_stops_child_and_updates_lasting_problem(monkeypatch):
 
     app.change_settings(engine="server")
     assert first.stopped
-    assert app._engine is None
-    assert app.engine_state == "server"
-    assert app.problem == ""
+    assert app._engine is models[0]
+    assert models[0].started
+    models[0].problem = "No room"
+    app._engine_changed(models[0], "off")
+    assert app.engine_state == "off"
+    assert app.problem == "No room"
 
     app.change_settings(engine="builtin")
     assert len(engines) == 2
@@ -114,7 +138,8 @@ def test_window_hides_server_settings_for_builtin_engine():
 
     view = SimpleNamespace(
         _app=SimpleNamespace(config=config.Config(), engine_state="starting"),
-        _server_row=Row(), _api_key_row=Row(), _engine_row=Row(),
+        _server_row=Row(), _api_key_row=Row(), _admin_key_row=Row(),
+        _screenshots_row=Row(), _engine_row=Row(),
     )
 
     Window._show_engine(view)
@@ -130,4 +155,51 @@ def test_window_hides_server_settings_for_builtin_engine():
     Window._show_engine(view)
     assert view._server_row.visible
     assert view._api_key_row.visible
-    assert view._engine_row.subtitle == ""
+    assert view._admin_key_row.visible
+    assert view._screenshots_row.visible
+    assert view._engine_row.subtitle == "Ready"
+
+
+def test_silent_recording_never_reaches_the_server(monkeypatch):
+    monkeypatch.setattr(gnome_app.config_module, "load", lambda: config.Config(engine="server"))
+    app = gnome_app.Application()
+    calls = []
+    monkeypatch.setattr(
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(wav) or "words"
+    )
+
+    assert app._transcribe(to_wav(np.zeros(16000, np.int16), 16000)) == ""
+    assert calls == []
+
+
+def test_dictation_during_a_start_fails_at_once_and_says_why(monkeypatch):
+    monkeypatch.setattr(gnome_app.config_module, "load", lambda: config.Config(engine="server"))
+    app = gnome_app.Application()
+    model = gnome_app.ServerModel(app.config)
+    model._set_state("starting", "omni is starting…")
+    app._engine = model
+    monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
+
+    with pytest.raises(gnome_app._ModelUnavailable) as raised:
+        app._transcribe(b"wav")
+
+    assert gnome_app._reason(raised.value) == "omni is starting…"
+
+
+def test_screenshot_is_dropped_when_turned_off_during_a_dictation(monkeypatch):
+    monkeypatch.setattr(gnome_app.config_module, "load", lambda: config.Config(
+        engine="server", screenshots=False,
+    ))
+    app = gnome_app.Application()
+    calls = []
+    monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
+    monkeypatch.setattr(
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(png) or ""
+    )
+    screenshots = Screenshots()
+    request_id, pending = screenshots.ask()
+    screenshots.deliver(request_id, b"png")
+
+    app._transcribe(b"wav", pending)
+
+    assert calls == [None]

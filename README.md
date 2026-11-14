@@ -146,6 +146,7 @@ creating it with mode `0600`. If you create the file by hand, run
 | `hands_free_key` | `""` | Empty: double-tap the dictation key; or a different key |
 | `language` | `""` | Empty: the model detects it; `"en"`, `"de"`, ... forces one |
 | `sounds` | `true` | Play the tones |
+| `keep_dictations` | `false` | Save every recording, its screenshot and the transcripts, for measuring and tuning later |
 | `vocabulary` | `[]` | Known names and terms sent as context, e.g. `["Nicolas Mahn", "Qwen", "DRY"]` |
 
 Keys are `right_ctrl`, `right_alt`, `right_cmd` (Right Super), `right_shift`,
@@ -167,13 +168,22 @@ without a restart.
 - With a server and `screenshots` on, each dictation also sends a picture of the
   focused window to that URL, whatever it shows: a password manager, a bank, a
   private chat. Turn it off in the window when that matters. Screenshots are
-  kept in memory only. Only GNOME Shell may deliver one to the app; another
+  kept in memory only, unless `keep_dictations` is on. Only GNOME Shell may
+  deliver one to the app; another
   program pretending to be the app could ask the extension for one, but programs
   running as you can already read your keystrokes (see above).
 - Keyboard access lets every program running as you read your
   keystrokes (see above).
-- Transcripts are kept in memory only and never written to disk. The last one
-  stays on the clipboard, replacing what was there.
+- Unless `keep_dictations` is on, recordings, screenshots and transcripts are
+  kept in memory only and never written to disk. The last transcript stays on
+  the clipboard, replacing what was there.
+- With `keep_dictations` on, each dictation gets its own folder in
+  `~/.local/share/whisper-local/dictations`, readable only by you:
+  `audio.wav`, `screenshot.png` when one was sent, and `dictation.json` with
+  the settings, the model's answers with and without the screenshot, what was
+  typed, any error and the timings. Those screenshots show whatever was on
+  screen, so treat the folder like the passwords and chats it may contain.
+  Nothing is ever deleted; remove old folders yourself.
 
 ## Development
 

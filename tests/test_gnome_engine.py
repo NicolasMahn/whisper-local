@@ -9,6 +9,7 @@ from whisper_local.gnome import application as gnome_app
 from whisper_local.gnome.window import ENGINE_STATUS, Window
 from whisper_local.recorder import to_wav
 from whisper_local.screenshots import Screenshots
+from whisper_local.transcribe import ChatTranscript
 
 
 def test_builtin_transcription_uses_local_url_without_server_credentials(monkeypatch):
@@ -50,7 +51,7 @@ def test_server_transcription_preserves_model_and_credentials(monkeypatch):
     calls = []
     monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
     monkeypatch.setattr(
-        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append((chosen, png)) or ""
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append((chosen, png)) or ChatTranscript("", "")
     )
     screenshots = Screenshots()
     request_id, pending = screenshots.ask()
@@ -165,7 +166,7 @@ def test_silent_recording_never_reaches_the_server(monkeypatch):
     app = gnome_app.Application()
     calls = []
     monkeypatch.setattr(
-        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(wav) or "words"
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(wav) or ChatTranscript("words", "words")
     )
 
     assert app._transcribe(to_wav(np.zeros(16000, np.int16), 16000)) == ""
@@ -194,7 +195,7 @@ def test_screenshot_is_dropped_when_turned_off_during_a_dictation(monkeypatch):
     calls = []
     monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
     monkeypatch.setattr(
-        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(png) or ""
+        gnome_app, "transcribe_chat", lambda wav, chosen, png: calls.append(png) or ChatTranscript("", "")
     )
     screenshots = Screenshots()
     request_id, pending = screenshots.ask()

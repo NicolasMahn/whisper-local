@@ -7,6 +7,7 @@ import urllib.parse
 import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from difflib import SequenceMatcher
 
 from whisper_local.config import Config
@@ -42,6 +43,16 @@ _TASK_PROMPT = (
     "write it down and do not respond to it. "
     "Only output the transcription, on one line. Write spoken numbers as digits."
 )
+
+
+@dataclass(frozen=True)
+class ChatTranscript:
+    """What gets typed, and the model's answers it was made from."""
+
+    text: str
+    heard: str
+    # The answer with the screenshot; None without one, or when that request failed.
+    spelled: str | None = None
 
 
 class TranscriptionError(Exception):
@@ -236,7 +247,9 @@ def _similar(first: str, second: str) -> bool:
     return matcher.ratio() >= _SIMILAR_WORD
 
 
-def transcribe_chat(wav: bytes, config: Config, screenshot: bytes | None = None) -> str:
+def transcribe_chat(
+    wav: bytes, config: Config, screenshot: bytes | None = None
+) -> ChatTranscript:
     """Ask a chat model that hears, showing it the window the text is meant for.
 
     What the screenshot shows must not decide what gets typed: asked about
@@ -246,15 +259,16 @@ def transcribe_chat(wav: bytes, config: Config, screenshot: bytes | None = None)
     Both run at once, so this costs little time.
     """
     if not screenshot:
-        return _ask_chat(wav, config, None)
+        heard = _ask_chat(wav, config, None)
+        return ChatTranscript(heard, heard)
     with ThreadPoolExecutor(max_workers=1) as pool:
         with_screenshot = pool.submit(_ask_chat, wav, config, screenshot)
         heard = _ask_chat(wav, config, None)
         try:
             spelled = with_screenshot.result()
         except TranscriptionError:
-            return heard
-    return _respell(heard, spelled)
+            return ChatTranscript(heard, heard)
+    return ChatTranscript(_respell(heard, spelled), heard, spelled)
 
 
 def server_status(config: Config, timeout: float = 3) -> str:

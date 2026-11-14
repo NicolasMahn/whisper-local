@@ -4,6 +4,7 @@ from whisper_local import config
 from whisper_local.gnome import application as gnome_app
 from whisper_local.gnome import service
 from whisper_local.gnome.window import Window
+from whisper_local.transcribe import ChatTranscript
 
 
 def test_dbus_interface_exposes_properties_and_level_signal():
@@ -113,7 +114,7 @@ def test_application_transcribes_with_current_vocabulary(monkeypatch):
     monkeypatch.setattr(gnome_app, "is_silent", lambda wav: False)
     monkeypatch.setattr(
         gnome_app, "transcribe_chat",
-        lambda wav, settings, png: calls.append(settings.vocabulary.copy()) or "",
+        lambda wav, settings, png: calls.append(settings.vocabulary.copy()) or ChatTranscript("", ""),
     )
     monkeypatch.setattr(gnome_app.config_module, "load", config.Config)
     app = gnome_app.Application()

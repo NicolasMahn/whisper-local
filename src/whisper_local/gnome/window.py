@@ -173,8 +173,18 @@ class Window(Adw.ApplicationWindow):
             "notify::active", lambda row, _: self._app.change_settings(sounds=row.get_active())
         )
 
+        keep_row = Adw.SwitchRow(
+            title="Keep dictations on this computer",
+            subtitle="Audio, screenshots and text, in ~/.local/share/whisper-local/dictations",
+            active=config.keep_dictations,
+        )
+        keep_row.connect(
+            "notify::active",
+            lambda row, _: self._app.change_settings(keep_dictations=row.get_active()),
+        )
+
         group = Adw.PreferencesGroup()
-        for row in (key_row, hands_free_row, language_row, sounds_row):
+        for row in (key_row, hands_free_row, language_row, sounds_row, keep_row):
             group.add(row)
         return group
 

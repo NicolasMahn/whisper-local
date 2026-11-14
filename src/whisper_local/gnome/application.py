@@ -4,20 +4,27 @@ import sys
 import threading
 import time
 import tomllib
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import replace
+from datetime import datetime
 
 import sounddevice as sd
 from gi.repository import Adw, Gio, GLib, GObject
 
+from whisper_local import archive, cues, linux
 from whisper_local import config as config_module
-from whisper_local import cues, linux
 from whisper_local.app import Dictation
-from whisper_local.engine import Engine, installed_paths
+from whisper_local.engine import MODEL_NAME, Engine, installed_paths
 from whisper_local.platform import KEYS
 from whisper_local.recorder import Recorder, is_silent
 from whisper_local.screenshots import PendingScreenshot, Screenshots
 from whisper_local.server_model import ServerModel
-from whisper_local.transcribe import TranscriptionError, transcribe, transcribe_chat
+from whisper_local.transcribe import (
+    ChatTranscript,
+    TranscriptionError,
+    transcribe,
+    transcribe_chat,
+)
 
 from .service import Service
 from .window import KEYBOARD_PROBLEM, Window
@@ -95,6 +102,9 @@ class Application(Adw.Application):
         self._engine_problem = ""
         self._engine: Engine | ServerModel | None = None
         self._screenshots = Screenshots()
+        # Writing to disk must not hold up the paste.
+        self._archive_writer = ThreadPoolExecutor(max_workers=1)
+        self._archive_root = archive.ARCHIVE_PATH
         self._listening = False
         self._problem_timeout = 0
         try:
@@ -286,27 +296,59 @@ class Application(Adw.Application):
     def _transcribe(self, wav: bytes, screenshot: PendingScreenshot | None = None) -> str:
         # Reads self.config per call so changed settings apply without a restart.
         settings = self.config
-        if is_silent(wav):
-            return ""
-        engine = self._engine
-        if settings.engine == "builtin":
-            # The engine changes just after the settings when they are switched.
-            if (
-                engine is None
-                or isinstance(engine, ServerModel)
-                or not engine.wait_ready()
-                or engine.url is None
-            ):
-                raise TranscriptionError("unreachable")
-            settings = replace(settings, url=engine.url, api_key="", model="whisper")
-            text = transcribe(wav, settings)
-        else:
-            text = self._transcribe_on_server(wav, screenshot)
-        if text:
-            _on_main_loop(self._remember, text)
-        return text
+        entry = archive.Entry(
+            started=datetime.now().astimezone(),
+            wav=wav,
+            engine=settings.engine,
+            model=settings.model if settings.engine == "server" else MODEL_NAME,
+            language=settings.language,
+            vocabulary=list(settings.vocabulary),
+        )
+        began = time.monotonic()
+        try:
+            entry.text = self._transcribe_entry(entry, settings, screenshot)
+        except Exception as error:
+            entry.error = _reason(error)
+            raise
+        finally:
+            entry.transcription_seconds = round(time.monotonic() - began, 3)
+            if settings.keep_dictations:
+                self._archive_writer.submit(archive.keep_quietly, entry, self._archive_root)
+        if entry.text:
+            _on_main_loop(self._remember, entry.text)
+        return entry.text
 
-    def _transcribe_on_server(self, wav: bytes, screenshot: PendingScreenshot | None) -> str:
+    def _transcribe_entry(
+        self,
+        entry: archive.Entry,
+        settings: config_module.Config,
+        screenshot: PendingScreenshot | None,
+    ) -> str:
+        wav = entry.wav
+        if is_silent(wav):
+            entry.silent = True
+            return ""
+        if settings.engine == "server":
+            transcript, entry.screenshot = self._transcribe_on_server(wav, screenshot)
+            entry.heard, entry.spelled = transcript.heard, transcript.spelled
+            return transcript.text
+        engine = self._engine
+        # The engine changes just after the settings when they are switched.
+        if (
+            engine is None
+            or isinstance(engine, ServerModel)
+            or not engine.wait_ready()
+            or engine.url is None
+        ):
+            raise TranscriptionError("unreachable")
+        settings = replace(settings, url=engine.url, api_key="", model="whisper")
+        entry.heard = transcribe(wav, settings)
+        return entry.heard
+
+    def _transcribe_on_server(
+        self, wav: bytes, screenshot: PendingScreenshot | None
+    ) -> tuple[ChatTranscript, bytes | None]:
+        """The transcript, and the screenshot it was made with."""
         model = self._engine if isinstance(self._engine, ServerModel) else None
         if model is not None and model.state != "ready":
             model.recheck()
@@ -315,8 +357,10 @@ class Application(Adw.Application):
         png = screenshot.wait() if screenshot is not None else None
         # Read after the waiting: the settings may have changed during it.
         settings = self.config
+        if not settings.screenshots:
+            png = None
         try:
-            return transcribe_chat(wav, settings, png if settings.screenshots else None)
+            return transcribe_chat(wav, settings, png), png
         except TranscriptionError as error:
             # The model may have gone away since it was last seen.
             if model is not None and (

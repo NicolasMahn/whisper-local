@@ -292,7 +292,7 @@ def test_chat_keeps_the_screenshot_in_its_own_turn_before_the_audio(monkeypatch)
 def test_screenshot_may_correct_the_spelling_of_what_was_said(heard, spelled, typed, monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=heard, spelled=spelled)
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png") == typed
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == typed
 
 
 @pytest.mark.parametrize("heard, spelled", [
@@ -311,13 +311,23 @@ def test_screenshot_may_correct_the_spelling_of_what_was_said(heard, spelled, ty
 def test_screenshot_cannot_change_what_was_said(heard, spelled, monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=heard, spelled=spelled)
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png") == heard
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == heard
 
 
 def test_failed_screenshot_request_still_gives_what_was_heard(monkeypatch):
     stub_chat_by_turns(monkeypatch, heard="words", spelled=OSError("too big"))
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png") == "words"
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == "words"
+
+
+def test_transcript_keeps_both_answers_for_later_study(monkeypatch):
+    stub_chat_by_turns(monkeypatch, heard="Ask Jeff, please", spelled="Ask Jev please")
+
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+
+    assert (transcript.text, transcript.heard, transcript.spelled) == (
+        "Ask Jev, please", "Ask Jeff, please", "Ask Jev please",
+    )
 
 
 def test_failed_request_without_screenshot_is_a_failure(monkeypatch):
@@ -366,7 +376,7 @@ def test_chat_answer_that_hit_the_limit_is_not_typed(monkeypatch):
 def test_chat_answer_cannot_press_enter_or_send_escapes(monkeypatch):
     stub_chat(monkeypatch, content=" first line\nrm -rf ~\n\x1b[201~")
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1")) == "first line rm -rf ~ [201~"
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1")).text == "first line rm -rf ~ [201~"
 
 
 def test_local_server_is_not_reached_through_a_proxy(monkeypatch):

@@ -24,6 +24,8 @@ class Config:
     # Empty lets the model detect the language; "en", "de", ... forces one.
     language: str = ""
     sounds: bool = True
+    # Writes every recording, screenshot and transcript to disk; see archive.py.
+    keep_dictations: bool = False
     vocabulary: list[str] = field(default_factory=list)
 
     def __post_init__(self):

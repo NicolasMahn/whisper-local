@@ -619,3 +619,31 @@ def test_each_recording_is_transcribed_with_what_was_captured_as_it_started():
         job()
 
     assert seen == ["first window", "second window"]
+
+
+def test_finished_hears_each_recording_after_its_paste_with_the_key_wait():
+    clock = FakeClock()
+    jobs, events = [], []
+
+    def insert(text):
+        clock.now += 0.1
+        events.append(("pasted", text))
+
+    dictation = Dictation(
+        FakeRecorder(),
+        lambda _wav, captured: "words",
+        insert,
+        submit=jobs.append,
+        clock=clock,
+        capture=lambda: "window",
+        finished=lambda captured, waited, pasted: events.append(
+            ("finished", captured, waited, round(pasted, 3))
+        ),
+    )
+
+    dictation.pressed()
+    clock.now = 0.5
+    dictation.released()
+    jobs[0]()
+
+    assert events == [("pasted", "words"), ("finished", "window", 0, 0.1)]

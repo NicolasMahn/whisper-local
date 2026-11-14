@@ -1,4 +1,5 @@
 from dataclasses import replace
+from datetime import datetime
 from types import SimpleNamespace
 
 import numpy as np
@@ -57,7 +58,7 @@ def test_server_transcription_preserves_model_and_credentials(monkeypatch):
     request_id, pending = screenshots.ask()
     screenshots.deliver(request_id, b"png")
 
-    app._transcribe(b"wav", pending)
+    app._transcribe(b"wav", gnome_app._Recording(datetime.now(), pending))
 
     assert calls == [(settings, b"png")]
 
@@ -201,6 +202,6 @@ def test_screenshot_is_dropped_when_turned_off_during_a_dictation(monkeypatch):
     request_id, pending = screenshots.ask()
     screenshots.deliver(request_id, b"png")
 
-    app._transcribe(b"wav", pending)
+    app._transcribe(b"wav", gnome_app._Recording(datetime.now(), pending))
 
     assert calls == [None]

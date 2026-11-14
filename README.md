@@ -180,8 +180,10 @@ without a restart.
 - With `keep_dictations` on, each dictation gets its own folder in
   `~/.local/share/whisper-local/dictations`, readable only by you:
   `audio.wav`, `screenshot.png` when one was sent, and `dictation.json` with
-  the settings, the model's answers with and without the screenshot, what was
-  typed, any error and the timings. Those screenshots show whatever was on
+  the app's version and commit, the settings (never the keys), the model's
+  answers with and without the screenshot, what was typed, any error and how
+  long each step took. Folders are written after the paste, so keeping them
+  never delays the text. Those screenshots show whatever was on
   screen, so treat the folder like the passwords and chats it may contain.
   Nothing is ever deleted; remove old folders yourself.
 

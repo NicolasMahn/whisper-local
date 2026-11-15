@@ -3,11 +3,25 @@ import sys
 import threading
 import time
 from collections.abc import Callable
+from dataclasses import dataclass
 from typing import Any
 
 
 def _print_error(error: Exception) -> None:
     print(f"whisper-local: {type(error).__name__}", file=sys.stderr)
+
+
+@dataclass(frozen=True)
+class Outcome:
+    """How a dictation ended; times are in seconds."""
+
+    pasted: bool
+    error: Exception | None = None
+    # From the end of the recording until its transcription began.
+    queued: float | None = None
+    # Pasting with a trigger key held would change the shortcut, so it waits.
+    key_release_wait: float | None = None
+    paste: float | None = None
 
 
 class Dictation:
@@ -17,12 +31,14 @@ class Dictation:
     transcription runs through `submit`, which by default is a single daemon
     worker: transcripts are inserted in the order they were spoken, and
     pending ones die with the process instead of pasting after quitting.
+    Pasting runs through `paste`, by default right after transcription. Given
+    a worker of its own, the next recording is transcribed while a finished
+    one waits for the trigger keys' release.
 
     `capture` runs as each recording starts, for what can only be known then,
     such as the window being dictated into; `transcribe` gets its result along
-    with the recording, and `finished` gets it back once the text is pasted
-    or the job failed, with the seconds spent waiting for the trigger keys'
-    release and pasting.
+    with the recording, and `finished` gets it back with the `Outcome` once
+    nothing waits for the job any more.
 
     `on_state` hears "listening", "hands_free", "transcribing" or "idle"
     whenever that changes. `on_error` hears every failure. Both may be called
@@ -42,7 +58,8 @@ class Dictation:
         on_error: Callable[[Exception], None] = _print_error,
         hands_free_key: str = "",
         capture: Callable[[], Any] = lambda: None,
-        finished: Callable[[Any, float, float], None] = lambda captured, waited, pasted: None,
+        finished: Callable[[Any, Outcome], None] = lambda captured, outcome: None,
+        paste: Callable[[Callable[[], None]], None] = lambda job: job(),
     ):
         self._recorder = recorder
         self._transcribe = transcribe
@@ -51,7 +68,8 @@ class Dictation:
         self._finished = finished
         self._insert_text = insert_text
         self._cue = cue
-        self._submit = submit or _start_worker()
+        self._submit = submit or start_worker()
+        self._paste = paste
         self._clock = clock
         self._min_seconds = min_seconds
         self._dedicated_hands_free = bool(hands_free_key)
@@ -180,7 +198,8 @@ class Dictation:
         captured = self._captured
         self._stop_recording(pending=1)
         self._cue("stop")
-        self._submit(lambda: self._transcribe_and_insert(wav, captured))
+        submitted = self._clock()
+        self._submit(lambda: self._transcribe_job(wav, captured, submitted))
 
     def _stop_recording(self, pending: int = 0) -> None:
         self._captured = None
@@ -188,22 +207,36 @@ class Dictation:
         self._hands_free = False
         self._report_state(pending)
 
-    def _transcribe_and_insert(self, wav: bytes, captured: Any) -> None:
-        waited = pasted = 0.0
+    def _transcribe_job(self, wav: bytes, captured: Any, submitted: float) -> None:
+        queued = self._clock() - submitted
         try:
             text = self._transcribe(wav, captured)
-            if text:
-                began = self._clock()
-                self._key_up.wait()
-                key_up = self._clock()
-                self._insert_text(text)
-                waited, pasted = key_up - began, self._clock() - key_up
         except Exception as error:
             self._fail(error)
-        finally:
-            self._report_state(-1)
+            self._end(captured, Outcome(False, error, queued))
+            return
+        if not text:
+            self._end(captured, Outcome(False, queued=queued))
+            return
+        self._paste(lambda: self._paste_job(text, captured, queued))
+
+    def _paste_job(self, text: str, captured: Any, queued: float) -> None:
+        began = self._clock()
+        self._key_up.wait()
+        key_up = self._clock()
         try:
-            self._finished(captured, waited, pasted)
+            self._insert_text(text)
+        except Exception as error:
+            self._fail(error)
+            outcome = Outcome(False, error, queued, key_up - began)
+        else:
+            outcome = Outcome(True, None, queued, key_up - began, self._clock() - key_up)
+        self._end(captured, outcome)
+
+    def _end(self, captured: Any, outcome: Outcome) -> None:
+        self._report_state(-1)
+        try:
+            self._finished(captured, outcome)
         except Exception as error:
             # An exception here would end the worker and every later dictation.
             _print_error(error)
@@ -226,7 +259,7 @@ class Dictation:
         self._cue("error")
 
 
-def _start_worker() -> Callable[[Callable[[], None]], None]:
+def start_worker() -> Callable[[Callable[[], None]], None]:
     jobs: queue.Queue[Callable[[], None]] = queue.Queue()
 
     def work() -> None:

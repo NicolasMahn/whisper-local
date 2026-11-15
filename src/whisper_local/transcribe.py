@@ -2,6 +2,7 @@ import base64
 import http.client
 import json
 import re
+import threading
 import time
 import urllib.error
 import urllib.parse
@@ -9,6 +10,7 @@ import urllib.request
 import uuid
 from concurrent.futures import ThreadPoolExecutor
 from concurrent.futures import TimeoutError as FutureTimeout
+from collections.abc import Callable
 from dataclasses import dataclass
 from difflib import SequenceMatcher
 
@@ -25,6 +27,9 @@ _WORD = re.compile(r"\w+(?:-\w+)*")
 # the paste for 9 s on a 1.5 s recording.
 _SPELLING_GRACE = 0.5
 _SPELLING_GRACE_SHARE = 0.2
+# A screenshot answer this much longer than the audio's is copying the screen.
+_SPELLING_RUNAWAY_SHARE = 1.5
+_SPELLING_RUNAWAY_CHARACTERS = 40
 LOCAL_HOSTS = ("localhost", "127.0.0.1", "::1")
 
 # Tested against qwen3-omni-30b. The screenshot sits in its own, already
@@ -53,17 +58,26 @@ _TASK_PROMPT = (
 
 
 @dataclass(frozen=True)
+class ChatAnswer:
+    """One request's answer, or why there is none, and what it cost."""
+
+    text: str | None
+    # Why `text` is None: "too slow", "stopped", "ran on", "http error 503", ...
+    error: str | None = None
+    finish_reason: str | None = None
+    tokens: int | None = None
+    first_text_seconds: float | None = None
+    seconds: float | None = None
+
+
+@dataclass(frozen=True)
 class ChatTranscript:
-    """What gets typed, and the model's answers it was made from."""
+    """What gets typed, and the answers it was made from."""
 
     text: str
-    heard: str
-    # The answer with the screenshot; None without one, or when it was not used.
-    spelled: str | None = None
-    heard_seconds: float | None = None
-    spelled_seconds: float | None = None
-    # Why the screenshot's answer was not used, such as "too slow".
-    spelled_error: str | None = None
+    heard: ChatAnswer
+    # The answer with the screenshot; None when no screenshot was sent.
+    spelled: ChatAnswer | None = None
 
 
 class TranscriptionError(Exception):
@@ -156,6 +170,7 @@ def transcribe(wav: bytes, config: Config, timeout: float = 30) -> str:
     del payload
     if text is None:
         raise TranscriptionError("unexpected response")
+    text = _clean(text)
     return "" if _echoes_vocabulary(text, config.vocabulary) else text
 
 
@@ -183,55 +198,123 @@ def _chat_messages(wav: bytes, config: Config, screenshot: bytes | None) -> list
     return messages
 
 
-def _chat_text(payload: bytes) -> str | None:
-    try:
-        choice = json.loads(payload)["choices"][0]
-        # Hitting the limit means the model ran away, not that someone spoke this much.
-        if choice.get("finish_reason") == "length":
-            raise TranscriptionError("ran on")
-        # A line break could press Enter in a terminal the text is pasted into,
-        # and an escape character could do anything else there.
-        text = choice["message"]["content"]
-        return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
-    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
-        return None
+def _clean(text: str) -> str:
+    # A line break could press Enter in a terminal the text is pasted into,
+    # and an escape character could do anything else there.
+    return " ".join("".join(c for c in text if c.isprintable() or c.isspace()).split())
 
 
-def _ask_chat(wav: bytes, config: Config, screenshot: bytes | None) -> str:
+def _max_tokens(seconds: float) -> int:
+    # Well above any speaker's pace (measured 2-5 tokens a second), so only a
+    # looping model reaches it.
+    return 64 + int(16 * seconds)
+
+
+def _ask_chat(
+    wav: bytes,
+    config: Config,
+    screenshot: bytes | None,
+    max_tokens: int,
+    stop: Callable[[int], bool] = lambda characters: False,
+) -> ChatAnswer:
+    """Stream one answer; `stop`, asked as text arrives, can end it early.
+
+    Streaming is what makes stopping work: hanging up mid-answer makes the
+    server stop generating, while a plain request keeps the model busy until
+    its whole answer is done.
+    """
     seconds = len(wav) / _WAV_BYTES_PER_SECOND
     body = {
         "model": config.model,
         "messages": _chat_messages(wav, config, screenshot),
         "temperature": 0,
-        # Well above any speaker's pace. A server may keep generating after a
-        # client gives up, so a looping model must end by itself.
-        "max_tokens": 64 + int(16 * seconds),
+        "max_tokens": max_tokens,
+        "stream": True,
+        "stream_options": {"include_usage": True},
     }
     request = urllib.request.Request(
         f"{config.url}/chat/completions",
         data=json.dumps(body).encode(),
         headers={"Content-Type": "application/json", **auth_headers(config)},
     )
-    payload = _post(request, 30 + seconds)
-    text = _chat_text(payload)
-    del payload
-    if text is None:
+    began = time.monotonic()
+    deadline = began + 30 + seconds
+    parts: list[str] = []
+    characters = 0
+    first_text = finish_reason = tokens = None
+    plain = []
+    try:
+        with open_same_origin(request, timeout=30 + seconds) as response:
+            for line in response:
+                if stop(characters):
+                    raise TranscriptionError("stopped")
+                if time.monotonic() > deadline:
+                    raise TranscriptionError("unreachable")
+                line = line.strip()
+                if not line.startswith(b"data:"):
+                    # A server that ignores "stream" answers in one piece.
+                    plain.append(line)
+                    continue
+                data = line[5:].strip()
+                if data == b"[DONE]":
+                    break
+                chunk = json.loads(data)
+                if chunk.get("usage"):
+                    tokens = chunk["usage"].get("completion_tokens")
+                for choice in chunk.get("choices") or ():
+                    content = (choice.get("delta") or {}).get("content")
+                    if content:
+                        if first_text is None:
+                            first_text = time.monotonic()
+                        parts.append(content)
+                        characters += len(content)
+                    finish_reason = choice.get("finish_reason") or finish_reason
+        if not parts and plain:
+            choice = json.loads(b"".join(plain))["choices"][0]
+            parts = [choice["message"]["content"]]
+            finish_reason = choice.get("finish_reason")
+            tokens = (json.loads(b"".join(plain)).get("usage") or {}).get("completion_tokens")
+    except urllib.error.HTTPError as error:
+        raise TranscriptionError("http error", error.code) from None
+    except TranscriptionError:
+        raise
+    except (ValueError, KeyError, IndexError, TypeError, AttributeError):
+        raise TranscriptionError("unexpected response") from None
+    # Timeouts while reading the response arrive as bare OSErrors, not URLError.
+    except (OSError, http.client.HTTPException):
+        raise TranscriptionError("unreachable") from None
+    # Hitting the limit means the model ran away, not that someone spoke this much.
+    if finish_reason == "length":
+        raise TranscriptionError("ran on")
+    if finish_reason is None:
         raise TranscriptionError("unexpected response")
-    return "" if _echoes_vocabulary(text, config.vocabulary) else text
+    text = _clean("".join(parts))
+    return ChatAnswer(
+        "" if _echoes_vocabulary(text, config.vocabulary) else text,
+        finish_reason=finish_reason,
+        tokens=tokens,
+        first_text_seconds=None if first_text is None else round(first_text - began, 3),
+        seconds=_since(began),
+    )
 
 
 def _letters(word: str) -> str:
     return "".join(character for character in word.casefold() if character.isalnum())
 
 
-def _respell(heard: str, spelled: str) -> str:
+def _respell(heard: str, spelled: str, vocabulary: list[str] = ()) -> str:
     """`heard`, with words swapped for the same or similar ones from `spelled`.
 
-    Only ever swaps words, so nothing `spelled` adds can reach the text.
+    Only ever swaps words, so nothing `spelled` adds can reach the text. A
+    swap must also keep the meaning, so words that differ in letters are
+    swapped only for a name (capitalized, or a known word) and never when a
+    digit changes, a negating prefix differs ("enable", "disable") or the
+    words are short enough for one letter to matter ("now", "not").
     """
     found = list(_WORD.finditer(heard))
     ours = [word.group() for word in found]
     theirs = _WORD.findall(spelled)
+    known = {word.casefold() for term in vocabulary for word in _WORD.findall(term)}
     text, position = [], 0
 
     def swap(start: int, end: int, word: str) -> None:
@@ -245,12 +328,41 @@ def _respell(heard: str, spelled: str) -> str:
         if tag != "replace":
             continue
         if _letters("".join(old)) == _letters("".join(new)):
-            swap(found[i1].start(), found[i2 - 1].end(), " ".join(new))
-        elif len(old) == len(new) and all(map(_similar, old, new)):
+            if not _only_loses_capitals(" ".join(old), " ".join(new)):
+                swap(found[i1].start(), found[i2 - 1].end(), " ".join(new))
+        elif len(old) == len(new) and all(
+            _similar(ours_word, their_word) and _keeps_meaning(ours_word, their_word, known)
+            for ours_word, their_word in zip(old, new)
+        ):
             for offset, word in enumerate(new):
                 swap(found[i1 + offset].start(), found[i1 + offset].end(), word)
     text.append(heard[position:])
     return "".join(text)
+
+
+def _only_loses_capitals(old: str, new: str) -> bool:
+    # "Whisper Local" written as "whisper local" fixes nothing.
+    return old.casefold() == new.casefold() and (
+        sum(map(str.isupper, new)) < sum(map(str.isupper, old))
+    )
+
+
+_PREFIXES = ("", "un", "dis", "de", "non", "in", "im", "il", "ir", "en", "em", "anti", "mis")
+
+
+def _keeps_meaning(old: str, new: str, known: set[str]) -> bool:
+    first, second = old.casefold(), new.casefold()
+    if first == second:
+        return True
+    if [c for c in old if c.isdigit()] != [c for c in new if c.isdigit()]:
+        return False
+    if max(len(first), len(second)) < 4 or _stems(first) & _stems(second):
+        return False
+    return second in known or any(c.isupper() for c in new)
+
+
+def _stems(word: str) -> set[str]:
+    return {word[len(prefix):] for prefix in _PREFIXES if word.startswith(prefix)}
 
 
 def _similar(first: str, second: str) -> bool:
@@ -259,7 +371,9 @@ def _similar(first: str, second: str) -> bool:
 
 
 def transcribe_chat(
-    wav: bytes, config: Config, screenshot: bytes | None = None
+    wav: bytes,
+    config: Config,
+    screenshot: Callable[[], bytes | None] | None = None,
 ) -> ChatTranscript:
     """Ask a chat model that hears, showing it the window the text is meant for.
 
@@ -267,33 +381,56 @@ def transcribe_chat(
     a recording without speech, the model wrote out a command it read in the
     picture. So the model also hears the recording alone, which no picture can
     influence, and the screenshot may only change the spelling of those words.
-    Both run at once, but they share the model, so each is slower than one
-    alone. The paste waits for the screenshot's answer only briefly after the
-    audio's; a late one is dropped and its request left to finish by itself.
+
+    Both requests run at once and share the model, so the screenshot's is cut
+    short wherever it cannot help: it starts once `screenshot` delivers one,
+    without holding up the audio's request; it ends when it grows far longer
+    than the audio's answer; and the paste waits for it only briefly after
+    the audio's answer is in.
     """
-    began = time.monotonic()
-    if not screenshot:
-        heard = _ask_chat(wav, config, None)
-        return ChatTranscript(heard, heard, heard_seconds=_since(began))
+    seconds = len(wav) / _WAV_BYTES_PER_SECOND
+    if screenshot is None:
+        heard = _ask_chat(wav, config, None, _max_tokens(seconds))
+        return ChatTranscript(heard.text, heard)
+    given_up = threading.Event()
+    heard_characters: int | None = None
+
+    def stop(characters: int) -> bool:
+        return given_up.is_set() or (
+            heard_characters is not None
+            and characters
+            > _SPELLING_RUNAWAY_SHARE * heard_characters + _SPELLING_RUNAWAY_CHARACTERS
+        )
+
+    def spell() -> ChatAnswer | None:
+        png = screenshot()
+        if not png or given_up.is_set():
+            return None
+        began = time.monotonic()
+        try:
+            # The audio's answer bounds this one, so it needs less room.
+            return _ask_chat(wav, config, png, 32 + int(8 * seconds), stop)
+        except TranscriptionError as error:
+            return ChatAnswer(None, _describe(error), seconds=_since(began))
+
     pool = ThreadPoolExecutor(max_workers=1)
     try:
-        with_screenshot = pool.submit(_ask_chat, wav, config, screenshot)
-        heard = _ask_chat(wav, config, None)
-        heard_seconds = _since(began)
+        spelling = pool.submit(spell)
+        heard = _ask_chat(wav, config, None, _max_tokens(seconds))
+        heard_characters = len(heard.text)
         try:
-            spelled = with_screenshot.result(
-                timeout=_SPELLING_GRACE + _SPELLING_GRACE_SHARE * heard_seconds
+            spelled = spelling.result(
+                timeout=_SPELLING_GRACE + _SPELLING_GRACE_SHARE * heard.seconds
             )
         except FutureTimeout:
-            return ChatTranscript(heard, heard, None, heard_seconds, None, "too slow")
-        except TranscriptionError as error:
-            return ChatTranscript(
-                heard, heard, None, heard_seconds, _since(began), _describe(error)
-            )
+            spelled = ChatAnswer(None, "too slow")
     finally:
+        given_up.set()
         pool.shutdown(wait=False)
+    if spelled is None or spelled.text is None:
+        return ChatTranscript(heard.text, heard, spelled)
     return ChatTranscript(
-        _respell(heard, spelled), heard, spelled, heard_seconds, _since(began)
+        _respell(heard.text, spelled.text, config.vocabulary), heard, spelled
     )
 
 

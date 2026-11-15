@@ -621,29 +621,67 @@ def test_each_recording_is_transcribed_with_what_was_captured_as_it_started():
     assert seen == ["first window", "second window"]
 
 
-def test_finished_hears_each_recording_after_its_paste_with_the_key_wait():
+def test_finished_hears_how_each_dictation_ended_after_its_paste():
     clock = FakeClock()
     jobs, events = [], []
+    texts = iter(["words", "more"])
 
     def insert(text):
         clock.now += 0.1
+        if text == "more":
+            raise OSError("no keyboard")
         events.append(("pasted", text))
 
     dictation = Dictation(
         FakeRecorder(),
-        lambda _wav, captured: "words",
+        lambda _wav, captured: next(texts),
         insert,
         submit=jobs.append,
         clock=clock,
         capture=lambda: "window",
-        finished=lambda captured, waited, pasted: events.append(
-            ("finished", captured, waited, round(pasted, 3))
+        on_error=lambda error: None,
+        finished=lambda captured, outcome: events.append(
+            (captured, outcome.pasted, type(outcome.error).__name__, round(outcome.paste or 0, 3))
         ),
+    )
+
+    for start in (0, 1):
+        clock.now = start
+        dictation.pressed()
+        clock.now = start + 0.5
+        dictation.released()
+    for job in jobs:
+        job()
+
+    assert events == [
+        ("pasted", "words"),
+        ("window", True, "NoneType", 0.1),
+        ("window", False, "OSError", 0),
+    ]
+
+
+def test_next_recording_is_transcribed_while_a_paste_waits_for_the_key():
+    clock = FakeClock()
+    jobs, pastes, transcribed = [], [], []
+    dictation = Dictation(
+        FakeRecorder(),
+        lambda _wav, captured: transcribed.append(captured) or "words",
+        lambda _text: None,
+        submit=jobs.append,
+        paste=pastes.append,
+        clock=clock,
+        capture=iter(["first", "second"]).__next__,
     )
 
     dictation.pressed()
     clock.now = 0.5
     dictation.released()
     jobs[0]()
+    clock.now = 1
+    dictation.pressed()  # held: the first paste must wait for its release
+    clock.now = 1.5
+    dictation.released()
+    jobs[1]()
 
-    assert events == [("pasted", "words"), ("finished", "window", 0, 0.1)]
+    assert transcribed == ["first", "second"]
+    assert len(pastes) == 2

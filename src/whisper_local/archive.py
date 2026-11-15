@@ -16,14 +16,15 @@ import os
 import shutil
 import subprocess
 import sys
-from dataclasses import dataclass, field
+from dataclasses import asdict, dataclass, field
 from datetime import datetime
 from importlib import metadata
 from pathlib import Path
 
 from whisper_local.config import Config
+from whisper_local.transcribe import ChatAnswer
 
-FORMAT = 2
+FORMAT = 3
 ARCHIVE_PATH = (
     Path(os.environ.get("XDG_DATA_HOME") or Path.home() / ".local/share")
     / "whisper-local"
@@ -44,10 +45,11 @@ class Entry:
     screenshot: bytes | None = None
     silent: bool = False
     # The model's answer to the audio alone, and its answer with the screenshot.
-    heard: str | None = None
-    spelled: str | None = None
-    spelled_error: str | None = None
+    heard: ChatAnswer | None = None
+    spelled: ChatAnswer | None = None
+    # What was to be typed, and whether it was.
     text: str | None = None
+    pasted: bool = False
     error: str | None = None
     seconds: dict[str, float | None] = field(default_factory=dict)
 
@@ -74,10 +76,10 @@ class Entry:
             "audio_seconds": self.audio_seconds,
             "screenshot_sent": self.screenshot is not None,
             "silent": self.silent,
-            "heard": self.heard,
-            "spelled": self.spelled,
-            "spelled_error": self.spelled_error,
+            "heard": None if self.heard is None else asdict(self.heard),
+            "spelled": None if self.spelled is None else asdict(self.spelled),
             "text": self.text,
+            "pasted": self.pasted,
             "error": self.error,
             "seconds": self.seconds,
         }

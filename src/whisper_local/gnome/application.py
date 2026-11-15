@@ -13,13 +13,14 @@ from gi.repository import Adw, Gio, GLib, GObject
 
 from whisper_local import archive, cues, linux
 from whisper_local import config as config_module
-from whisper_local.app import Dictation
+from whisper_local.app import Dictation, Outcome, start_worker
 from whisper_local.engine import MODEL_NAME, Engine, installed_paths
 from whisper_local.platform import KEYS
 from whisper_local.recorder import Recorder, is_silent
 from whisper_local.screenshots import PendingScreenshot, Screenshots
 from whisper_local.server_model import ServerModel
 from whisper_local.transcribe import (
+    ChatAnswer,
     ChatTranscript,
     TranscriptionError,
     transcribe,
@@ -31,6 +32,10 @@ from .window import KEYBOARD_PROBLEM, Window
 
 APP_ID = "io.github.nicolasmahn.WhisperLocal"
 PROBLEM_SECONDS = 5
+
+
+def _rounded(seconds: float | None) -> float | None:
+    return None if seconds is None else round(seconds, 3)
 
 
 def _on_main_loop(function, *args) -> None:
@@ -238,6 +243,7 @@ class Application(Adw.Application):
             linux.insert_text,
             capture=self._capture,
             finished=self._finished,
+            paste=start_worker(),
             cue=self._cue,
             hands_free_key=self.config.hands_free_key,
             on_state=lambda state: _on_main_loop(self._update, "state", state),
@@ -332,13 +338,17 @@ class Application(Adw.Application):
             _on_main_loop(self._remember, entry.text)
         return entry.text
 
-    def _finished(self, recording: _Recording, waited: float, pasted: float) -> None:
+    def _finished(self, recording: _Recording, outcome: Outcome) -> None:
         """Keep the dictation, now that nothing waits for it any more."""
         entry = recording.entry
         if entry is None:
             return
-        entry.seconds["key_release_wait"] = round(waited, 3)
-        entry.seconds["paste"] = round(pasted, 3)
+        entry.pasted = outcome.pasted
+        if outcome.error is not None and entry.error is None:
+            entry.error = _reason(outcome.error)
+        entry.seconds["queued"] = _rounded(outcome.queued)
+        entry.seconds["key_release_wait"] = _rounded(outcome.key_release_wait)
+        entry.seconds["paste"] = _rounded(outcome.paste)
         self._archive_writer.submit(archive.keep_quietly, entry, self._archive_root)
 
     def _transcribe_entry(
@@ -352,11 +362,8 @@ class Application(Adw.Application):
             entry.silent = True
             return ""
         if settings.engine == "server":
-            transcript, entry.screenshot = self._transcribe_on_server(wav, screenshot, entry)
+            transcript = self._transcribe_on_server(wav, screenshot, entry)
             entry.heard, entry.spelled = transcript.heard, transcript.spelled
-            entry.spelled_error = transcript.spelled_error
-            entry.seconds["heard"] = transcript.heard_seconds
-            entry.seconds["spelled"] = transcript.spelled_seconds
             return transcript.text
         engine = self._engine
         # The engine changes just after the settings when they are switched.
@@ -368,27 +375,35 @@ class Application(Adw.Application):
         ):
             raise TranscriptionError("unreachable")
         settings = replace(settings, url=engine.url, api_key="", model="whisper")
-        entry.heard = transcribe(wav, settings)
-        return entry.heard
+        began = time.monotonic()
+        text = transcribe(wav, settings)
+        entry.heard = ChatAnswer(text, seconds=_rounded(time.monotonic() - began))
+        return text
 
     def _transcribe_on_server(
-        self, wav: bytes, screenshot: PendingScreenshot | None, entry: archive.Entry
-    ) -> tuple[ChatTranscript, bytes | None]:
-        """The transcript, and the screenshot it was made with."""
+        self, wav: bytes, pending: PendingScreenshot | None, entry: archive.Entry
+    ) -> ChatTranscript:
         model = self._engine if isinstance(self._engine, ServerModel) else None
         if model is not None and model.state != "ready":
             model.recheck()
             if not model.wait_ready():
                 raise _ModelUnavailable(model.problem or "Speech model not available")
-        began = time.monotonic()
-        png = screenshot.wait() if screenshot is not None else None
-        entry.seconds["screenshot_wait"] = round(time.monotonic() - began, 3)
-        # Read after the waiting: the settings may have changed during it.
+
+        def screenshot() -> bytes | None:
+            began = time.monotonic()
+            png = pending.wait()
+            entry.seconds["screenshot_wait"] = _rounded(time.monotonic() - began)
+            # The setting may have been turned off during the wait.
+            if not self.config.screenshots:
+                return None
+            entry.screenshot = png
+            return png
+
         settings = self.config
-        if not settings.screenshots:
-            png = None
         try:
-            return transcribe_chat(wav, settings, png), png
+            return transcribe_chat(
+                wav, settings, screenshot if pending is not None and settings.screenshots else None
+            )
         except TranscriptionError as error:
             # The model may have gone away since it was last seen.
             if model is not None and (

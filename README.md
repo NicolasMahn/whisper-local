@@ -39,9 +39,19 @@ command. So the recording is also sent without the screenshot, which no picture
 can influence, and that answer is what gets typed. From the screenshot's answer,
 only words it writes the same or nearly the same way are swapped in: "Jeff"
 becomes "Jev", "whisper local" becomes "whisper-local". Added words and symbols
-are dropped. What remains is that a picture can change a word into a similar
-one. Line breaks and control characters are removed, so an answer cannot press
-Enter in a terminal.
+are dropped. A word that changes letters is swapped only for a name (capitalized
+or a known word), and never when that would change its meaning: digits stay
+("644" never becomes "664"), opposite prefixes stay ("enable" never becomes
+"disable"), and short words stay ("now" never becomes "not"). What remains is
+that a picture can change a name into a similar one. Line breaks and control
+characters are removed, so an answer cannot press Enter in a terminal.
+
+Both requests share the model, so the screenshot's is kept out of the way: the
+audio's request starts at once, without waiting for the screenshot; the
+screenshot's answer is cut off when it grows far longer than the audio's, which
+happens when the model copies text off the screen; and the paste waits for it
+only briefly after the audio's answer. Answers are streamed, so a request cut
+off this way stops on the server too.
 
 With an admin key, the app starts a model that is off on a local_llm server: when
 the app starts and when you dictate. Starting takes minutes; the pill says so,

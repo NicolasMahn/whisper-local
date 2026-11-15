@@ -6,7 +6,8 @@ import pytest
 from whisper_local import archive, config
 from whisper_local.gnome import application as gnome_app
 from whisper_local.screenshots import Screenshots
-from whisper_local.transcribe import ChatTranscript, TranscriptionError
+from whisper_local.app import Outcome
+from whisper_local.transcribe import ChatAnswer, ChatTranscript, TranscriptionError
 
 STARTED = datetime(2026, 11, 15, 14, 3, 22, 123456, timezone(timedelta(hours=1)))
 
@@ -15,7 +16,8 @@ def test_keeps_audio_screenshot_and_record_in_one_private_folder(tmp_path):
     settings = config.Config(engine="server", api_key="secret", admin_key="admin")
     entry = archive.Entry(
         recorded_at=STARTED, wav=bytes(44 + 32_000 * 2), settings=settings, model="omni",
-        screenshot=b"png", heard="Ask Jeff", spelled="Ask Jev", text="Ask Jev",
+        screenshot=b"png", heard=ChatAnswer("Ask Jeff"), spelled=ChatAnswer("Ask Jev"),
+        text="Ask Jev", pasted=True,
     )
 
     folder = archive.keep(entry, tmp_path / "dictations")
@@ -32,7 +34,9 @@ def test_keeps_audio_screenshot_and_record_in_one_private_folder(tmp_path):
     assert record["settings"]["model"] == "omni"
     assert record["settings"]["screenshots"] is True
     assert record["audio_seconds"] == 2.0
-    assert (record["heard"], record["spelled"], record["text"]) == ("Ask Jeff", "Ask Jev", "Ask Jev")
+    assert (record["heard"]["text"], record["spelled"]["text"], record["text"]) == (
+        "Ask Jeff", "Ask Jev", "Ask Jev",
+    )
 
 
 def test_version_names_the_commit_of_a_checkout():
@@ -72,8 +76,8 @@ def kept(app, tmp_path) -> list[dict]:
 def test_dictation_is_kept_only_after_its_paste(monkeypatch, tmp_path):
     app = server_app(
         monkeypatch, tmp_path,
-        lambda wav, settings, png: ChatTranscript(
-            "Ask Jev", "Ask Jeff", "Ask Jev", heard_seconds=1.5, spelled_seconds=1.7,
+        lambda wav, settings, screenshot: screenshot() and ChatTranscript(
+            "Ask Jev", ChatAnswer("Ask Jeff", seconds=1.5), ChatAnswer("Ask Jev", seconds=1.7),
         ),
         keep_dictations=True,
     )
@@ -81,39 +85,63 @@ def test_dictation_is_kept_only_after_its_paste(monkeypatch, tmp_path):
 
     assert app._transcribe(b"wav", started) == "Ask Jev"
     assert list(tmp_path.iterdir()) == []
-    app._finished(started, 0.25, 0.05)
+    app._finished(started, Outcome(True, None, 0.01, 0.25, 0.05))
 
     [record] = kept(app, tmp_path)
-    assert (record["heard"], record["spelled"], record["text"]) == ("Ask Jeff", "Ask Jev", "Ask Jev")
+    assert (record["heard"]["text"], record["spelled"]["text"], record["text"]) == (
+        "Ask Jeff", "Ask Jev", "Ask Jev",
+    )
     assert record["screenshot_sent"] is True
-    assert record["seconds"]["heard"] == 1.5
-    assert record["seconds"]["spelled"] == 1.7
+    assert (record["heard"]["seconds"], record["spelled"]["seconds"]) == (1.5, 1.7)
+    assert record["pasted"] is True
     assert (record["seconds"]["key_release_wait"], record["seconds"]["paste"]) == (0.25, 0.05)
     [folder] = tmp_path.iterdir()
     assert (folder / "screenshot.png").read_bytes() == b"png"
 
 
 def test_failed_dictation_is_kept_with_its_reason(monkeypatch, tmp_path):
-    def fail(wav, settings, png):
+    def fail(wav, settings, screenshot):
+        screenshot()
         raise TranscriptionError("unreachable")
 
     app = server_app(monkeypatch, tmp_path, fail, keep_dictations=True)
-    started = recording()
+    started = recording(b"png")
 
-    with pytest.raises(TranscriptionError):
+    with pytest.raises(TranscriptionError) as raised:
         app._transcribe(b"wav", started)
-    app._finished(started, 0, 0)
+    app._finished(started, Outcome(False, raised.value))
 
     [record] = kept(app, tmp_path)
     assert record["error"] == "Speech server unreachable"
-    assert record["text"] is None
+    assert (record["text"], record["pasted"]) == (None, False)
+    assert record["screenshot_sent"] is True
+
+
+def test_failed_paste_is_kept_as_not_pasted(monkeypatch, tmp_path):
+    app = server_app(
+        monkeypatch, tmp_path,
+        lambda wav, settings, screenshot: ChatTranscript("hi", ChatAnswer("hi")),
+        keep_dictations=True,
+    )
+    started = recording()
+
+    app._transcribe(b"wav", started)
+    app._finished(started, Outcome(False, OSError("no keyboard"), 0.0, 0.0))
+
+    [record] = kept(app, tmp_path)
+    assert (record["text"], record["pasted"]) == ("hi", False)
+    assert record["error"] == "Could not paste the text"
+    assert record["seconds"]["paste"] is None
 
 
 def test_nothing_is_kept_unless_asked(monkeypatch, tmp_path):
-    app = server_app(monkeypatch, tmp_path, lambda wav, settings, png: ChatTranscript("hi", "hi"))
+    app = server_app(
+        monkeypatch, tmp_path,
+        lambda wav, settings, screenshot: ChatTranscript("hi", ChatAnswer("hi")),
+    )
     started = recording(b"png")
 
     app._transcribe(b"wav", started)
-    app._finished(started, 0, 0)
+    app._finished(started, Outcome(True))
 
     assert kept(app, tmp_path) == []
